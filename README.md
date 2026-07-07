@@ -14,6 +14,8 @@ Required environment variables:
 export ROSSBOT_TOKEN=xoxb-...
 export ROSSBOT_APP_TOKEN=xapp-...
 export ROSSBOT_USER_ID=U...
+# Optional: defaults to Ross's Slack user id (U0ABQAC1RKJ)
+export ROSSBOT_ALLOWED_USER_ID=U0ABQAC1RKJ
 ```
 
 Rossbot defaults to `~/.rossbot/config.json`. You can override it with `--config` when starting the daemon.
@@ -63,13 +65,20 @@ pi session files are managed by the pi SDK for each project cwd.
 
 ## Slack behavior
 
-Top-level app mentions create or reuse a workflow for that thread:
+In registered project channels, top-level messages from the allowed Slack user create or reuse a workflow for that message's thread without mentioning the bot:
+
+```text
+/plan Add an operations dashboard
+hello from top level
+```
+
+Top-level app mentions also create or reuse a workflow for that thread:
 
 ```text
 @rossbot /plan Add an operations dashboard
 ```
 
-Thread replies are routed only when a workflow already exists for that Slack thread. Separate Slack threads map to separate pi sessions and can run concurrently; messages inside one thread are queued serially.
+Thread replies are routed only when a workflow already exists for that Slack thread. Separate Slack threads map to separate pi sessions and can run concurrently; messages inside one thread are queued serially. Messages from other human users are ignored and logged without a Slack reply.
 
 Commands:
 
@@ -80,7 +89,7 @@ Commands:
 - `/close` — marks the workflow closed and disposes the loaded session.
 - `/reset` — creates a fresh pi session for the same Slack thread.
 
-Plain thread replies are sent directly to the same pi session as follow-up prompts.
+Plain top-level messages and thread replies are sent directly to the corresponding pi session as follow-up prompts.
 
 ## Validation
 
