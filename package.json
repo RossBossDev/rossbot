@@ -1,0 +1,27 @@
+{
+  "name": "rossbot",
+  "version": "0.1.0",
+  "description": "Local Slack-to-pi daemon for Ross workflows",
+  "type": "module",
+  "bin": {
+    "rossbot": "./dist/cli.js"
+  },
+  "scripts": {
+    "dev": "tsx src/cli.ts start",
+    "typecheck": "tsc --noEmit",
+    "build": "tsc"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "UNLICENSED",
+  "dependencies": {
+    "@earendil-works/pi-coding-agent": "^0.80.3",
+    "@slack/bolt": "^4.7.3",
+    "dotenv": "^17.4.2"
+  },
+  "devDependencies": {
+    "@types/node": "^26.1.0",
+    "tsx": "^4.23.0",
+    "typescript": "^6.0.3"
+  }
+}
