@@ -15,7 +15,7 @@ export function normalizeSlackText(text: string, botUserId: string): string {
 
 export function parseCommand(text: string, botUserId: string): ParsedCommand {
   const normalized = normalizeSlackText(text, botUserId);
-  const match = normalized.match(/^\/(plan|implement|pr|status|close|reset)(?:\s+([\s\S]*))?$/);
+  const match = normalized.match(/^\/?(plan|implement|pr|status|close|reset)(?:\s+([\s\S]*))?$/);
   if (!match) return { type: "followUp", text: normalized };
 
   const [, command, args = ""] = match;
