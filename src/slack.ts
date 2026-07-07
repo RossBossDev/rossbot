@@ -31,7 +31,7 @@ export async function startSlackApp(input: {
 
   app.event("app_mention", async ({ event, client, logger }) => {
     const slackEvent = event as SlackEvent;
-    if (shouldIgnore(slackEvent)) return;
+    if (!isAuthorized(slackEvent, input.env, logger)) return;
 
     const channelId = slackEvent.channel;
     const threadTs = slackEvent.thread_ts ?? slackEvent.ts;
@@ -54,23 +54,27 @@ export async function startSlackApp(input: {
 
   app.message(async ({ message, client, logger }) => {
     const slackEvent = message as SlackEvent;
-    if (shouldIgnore(slackEvent)) return;
-    if (!slackEvent.thread_ts || !slackEvent.channel || !slackEvent.text) return;
+    if (!isAuthorized(slackEvent, input.env, logger)) return;
+    if (!slackEvent.channel || !slackEvent.text || !slackEvent.ts) return;
+    if (slackEvent.text.includes(`<@${input.env.botUserId}>`)) return;
 
     const project = findProject(input.config, slackEvent.channel);
     if (!project) return;
 
-    const workflow = await input.runner.getExistingWorkflow({
-      project,
-      channelId: slackEvent.channel,
-      threadTs: slackEvent.thread_ts,
-    });
+    const threadTs = slackEvent.thread_ts ?? slackEvent.ts;
+    const workflow = slackEvent.thread_ts
+      ? await input.runner.getExistingWorkflow({
+          project,
+          channelId: slackEvent.channel,
+          threadTs,
+        })
+      : await input.runner.getOrCreateWorkflow({ project, channelId: slackEvent.channel, threadTs });
 
-    if (!workflow || workflow.record.key !== workflowKey(slackEvent.channel, slackEvent.thread_ts)) return;
+    if (!workflow || workflow.record.key !== workflowKey(slackEvent.channel, threadTs)) return;
     if (workflow.record.status === "closed") {
       const command = parseCommand(slackEvent.text, input.env.botUserId);
       if (command.type !== "followUp") {
-        await postThreadReply(client, slackEvent.channel, slackEvent.thread_ts, "This workflow is closed. Use `/reset` to start a fresh session in this thread.");
+        await postThreadReply(client, slackEvent.channel, threadTs, "This workflow is closed. Use `/reset` to start a fresh session in this thread.");
       }
       return;
     }
@@ -86,11 +90,11 @@ export async function startSlackApp(input: {
           workflow,
           client,
           channelId: slackEvent.channel!,
-          threadTs: slackEvent.thread_ts!,
+          threadTs,
         });
       } catch (error) {
         logger.error(error);
-        await postThreadReply(client, slackEvent.channel!, slackEvent.thread_ts!, formatError(error));
+        await postThreadReply(client, slackEvent.channel!, threadTs, formatError(error));
       }
     });
   });
@@ -99,8 +103,18 @@ export async function startSlackApp(input: {
   console.log("rossbot Slack Socket Mode app started");
 }
 
-function shouldIgnore(event: SlackEvent): boolean {
-  return Boolean(event.bot_id) || event.type === "message" && event.user === undefined;
+function isAuthorized(
+  event: SlackEvent,
+  env: SlackEnv,
+  logger: { warn(message: string): void },
+): boolean {
+  if (event.bot_id || event.user === undefined) return false;
+  if (event.user === env.allowedUserId) return true;
+
+  logger.warn(
+    `Ignoring unauthorized Slack message from user ${event.user} in channel ${event.channel ?? "unknown"} at ${event.ts ?? "unknown"}`,
+  );
+  return false;
 }
 
 function findProject(config: RossbotConfig, channelId: string): ProjectConfig | undefined {

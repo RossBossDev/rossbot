@@ -17,6 +17,7 @@ export type SlackEnv = {
   botToken: string;
   appToken: string;
   botUserId: string;
+  allowedUserId: string;
 };
 
 export type CliCommand = { command: "start"; configPath: string } | { command: "projectAdd" };
