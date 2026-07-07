@@ -17,6 +17,23 @@ type SlackEvent = {
   thread_ts?: string;
 };
 
+type SlackStatusReaction = "eyes" | "white_check_mark" | "x";
+type SlackReaction = SlackStatusReaction | "hourglass_flowing_sand";
+
+type SlackStatusClient = {
+  reactions: {
+    add(args: { channel: string; timestamp: string; name: string }): Promise<unknown>;
+    remove(args: { channel: string; timestamp: string; name: string }): Promise<unknown>;
+  };
+};
+
+type SlackLogger = {
+  debug?(message: string): void;
+  warn(message: string): void;
+};
+
+const statusReactions: SlackStatusReaction[] = ["eyes", "white_check_mark", "x"];
+
 export async function startSlackApp(input: {
   config: RossbotConfig;
   env: SlackEnv;
@@ -29,52 +46,78 @@ export async function startSlackApp(input: {
     logLevel: LogLevel.INFO,
   });
 
-  app.event("app_mention", async ({ event, client, logger }) => {
-    const slackEvent = event as SlackEvent;
-    if (!isAuthorized(slackEvent, input.env, logger)) return;
+  for (const slashCommand of ["/plan", "/implement", "/pr"] as const) {
+    app.command(slashCommand, async ({ command, ack, client, logger, respond }) => {
+      await ack();
 
-    const channelId = slackEvent.channel;
-    const threadTs = slackEvent.thread_ts ?? slackEvent.ts;
-    if (!channelId || !threadTs || !slackEvent.text) return;
+      if (command.user_id !== input.env.allowedUserId) {
+        logger.warn(
+          `Ignoring unauthorized Slack slash command from user ${command.user_id} in channel ${command.channel_id}`,
+        );
+        await respond({ response_type: "ephemeral", text: "You are not authorized to use rossbot." });
+        return;
+      }
 
-    const project = findProject(input.config, channelId);
-    if (!project) {
-      logger.info(`No project registered for channel ${channelId}`);
-      return;
-    }
+      const channelId = command.channel_id;
+      const project = findProject(input.config, channelId);
+      if (!project) {
+        await respond({ response_type: "ephemeral", text: "This channel is not registered with rossbot." });
+        return;
+      }
 
-    const command = parseCommand(slackEvent.text, input.env.botUserId);
-    if (command.type === "followUp" && command.text.trim() === "") return;
+      const parsedCommand = parseSlashCommand(command.command, command.text ?? "");
+      const parent = await postTopLevelMessage(client, channelId, formatSlashCommandParentMessage(parsedCommand));
+      const threadTs = parent.ts;
+      const workflow = await input.runner.getOrCreateWorkflow({ project, channelId, threadTs });
 
-    const workflow = await input.runner.getOrCreateWorkflow({ project, channelId, threadTs });
-    await enqueue(workflow, async () => {
-      await handleParsedCommand({ command, runner: input.runner, workflow, client, channelId, threadTs });
+      await enqueue(workflow, async () => {
+        try {
+          await handleParsedCommand({
+            command: parsedCommand,
+            runner: input.runner,
+            workflow,
+            client,
+            channelId,
+            threadTs,
+          });
+        } catch (error) {
+          logger.error(error);
+          await postThreadReply(client, channelId, threadTs, formatError(error));
+        }
+      });
     });
-  });
+  }
 
   app.message(async ({ message, client, logger }) => {
     const slackEvent = message as SlackEvent;
     if (!isAuthorized(slackEvent, input.env, logger)) return;
     if (!slackEvent.channel || !slackEvent.text || !slackEvent.ts) return;
-    if (slackEvent.text.includes(`<@${input.env.botUserId}>`)) return;
 
-    const project = findProject(input.config, slackEvent.channel);
+    const channelId = slackEvent.channel;
+    const messageTs = slackEvent.ts;
+    const project = findProject(input.config, channelId);
     if (!project) return;
 
-    const threadTs = slackEvent.thread_ts ?? slackEvent.ts;
+    const isTopLevel = !slackEvent.thread_ts;
+    const threadTs = slackEvent.thread_ts ?? messageTs;
     const workflow = slackEvent.thread_ts
       ? await input.runner.getExistingWorkflow({
           project,
-          channelId: slackEvent.channel,
+          channelId,
           threadTs,
         })
-      : await input.runner.getOrCreateWorkflow({ project, channelId: slackEvent.channel, threadTs });
+      : await input.runner.getOrCreateWorkflow({ project, channelId, threadTs });
 
-    if (!workflow || workflow.record.key !== workflowKey(slackEvent.channel, threadTs)) return;
+    if (!workflow || workflow.record.key !== workflowKey(channelId, threadTs)) return;
     if (workflow.record.status === "closed") {
       const command = parseCommand(slackEvent.text, input.env.botUserId);
       if (command.type !== "followUp") {
-        await postThreadReply(client, slackEvent.channel, threadTs, "This workflow is closed. Use `/reset` to start a fresh session in this thread.");
+        await postThreadReply(
+          client,
+          channelId,
+          threadTs,
+          "This workflow is closed. Use `/reset` to start a fresh session in this thread.",
+        );
       }
       return;
     }
@@ -82,25 +125,105 @@ export async function startSlackApp(input: {
     const command = parseCommand(slackEvent.text, input.env.botUserId);
     if (command.type === "followUp" && command.text.trim() === "") return;
 
+    if (isTopLevel) {
+      await setStatusReaction(client, logger, { channel: channelId, timestamp: messageTs, to: "eyes" });
+    }
+
     await enqueue(workflow, async () => {
       try {
+        if (!isTopLevel) {
+          await addReaction(client, logger, { channel: channelId, timestamp: messageTs, name: "hourglass_flowing_sand" });
+        }
         await handleParsedCommand({
           command,
           runner: input.runner,
           workflow,
           client,
-          channelId: slackEvent.channel!,
+          channelId,
           threadTs,
         });
+        if (isTopLevel) {
+          await setStatusReaction(client, logger, { channel: channelId, timestamp: messageTs, to: "white_check_mark" });
+        }
       } catch (error) {
+        if (isTopLevel) {
+          await setStatusReaction(client, logger, { channel: channelId, timestamp: messageTs, to: "x" });
+        }
         logger.error(error);
-        await postThreadReply(client, slackEvent.channel!, threadTs, formatError(error));
+        await postThreadReply(client, channelId, threadTs, formatError(error));
+      } finally {
+        if (!isTopLevel) {
+          await removeReaction(client, logger, { channel: channelId, timestamp: messageTs, name: "hourglass_flowing_sand" });
+        }
       }
     });
   });
 
   await app.start();
   console.log("rossbot Slack Socket Mode app started");
+}
+
+async function setStatusReaction(
+  client: SlackStatusClient,
+  logger: SlackLogger,
+  input: { channel: string; timestamp: string; to: SlackStatusReaction },
+): Promise<void> {
+  for (const reaction of statusReactions.filter((reaction) => reaction !== input.to)) {
+    await removeReaction(client, logger, { ...input, name: reaction });
+  }
+  await addReaction(client, logger, { ...input, name: input.to });
+}
+
+async function removeReaction(
+  client: SlackStatusClient,
+  logger: SlackLogger,
+  input: { channel: string; timestamp: string; name: SlackReaction },
+): Promise<void> {
+  try {
+    await client.reactions.remove({ channel: input.channel, timestamp: input.timestamp, name: input.name });
+  } catch (error) {
+    const code = slackErrorCode(error);
+    if (code === "no_reaction" || code === "not_reacted") {
+      logger.debug?.(`Slack status reaction ${input.name} was not present on ${input.channel}/${input.timestamp}`);
+      return;
+    }
+    logger.warn(
+      `Unable to remove Slack status reaction ${input.name} from ${input.channel}/${input.timestamp}: ${formatSlackError(error)}`,
+    );
+  }
+}
+
+async function addReaction(
+  client: SlackStatusClient,
+  logger: SlackLogger,
+  input: { channel: string; timestamp: string; name: SlackReaction },
+): Promise<void> {
+  try {
+    await client.reactions.add({ channel: input.channel, timestamp: input.timestamp, name: input.name });
+  } catch (error) {
+    const code = slackErrorCode(error);
+    if (code === "already_reacted") {
+      logger.debug?.(`Slack status reaction ${input.name} already present on ${input.channel}/${input.timestamp}`);
+      return;
+    }
+    logger.warn(
+      `Unable to add Slack status reaction ${input.name} to ${input.channel}/${input.timestamp}: ${formatSlackError(error)}`,
+    );
+  }
+}
+
+function slackErrorCode(error: unknown): string | undefined {
+  if (error && typeof error === "object" && "data" in error) {
+    const data = (error as { data?: { error?: unknown } }).data;
+    return typeof data?.error === "string" ? data.error : undefined;
+  }
+  return undefined;
+}
+
+function formatSlackError(error: unknown): string {
+  const code = slackErrorCode(error);
+  if (code) return code;
+  return error instanceof Error ? error.message : String(error);
 }
 
 function isAuthorized(
@@ -119,6 +242,36 @@ function isAuthorized(
 
 function findProject(config: RossbotConfig, channelId: string): ProjectConfig | undefined {
   return config.projects.find((project) => project.channelId === channelId);
+}
+
+function parseSlashCommand(command: string, text: string): Extract<ReturnType<typeof parseCommand>, { type: "plan" | "implement" | "pr" }> {
+  switch (command) {
+    case "/plan":
+      return { type: "plan", args: text.trim() };
+    case "/implement":
+      return { type: "implement", args: text.trim() };
+    case "/pr":
+      return { type: "pr", args: text.trim() };
+    default:
+      throw new Error(`Unsupported slash command: ${command}`);
+  }
+}
+
+function formatSlashCommandParentMessage(command: ReturnType<typeof parseSlashCommand>): string {
+  const args = command.args ? ` ${command.args}` : "";
+  return `rossbot queued /${command.type}${args}`;
+}
+
+async function postTopLevelMessage(
+  client: { chat: { postMessage(args: { channel: string; text: string }): Promise<unknown> } },
+  channelId: string,
+  text: string,
+): Promise<{ ts: string }> {
+  const response = await client.chat.postMessage({ channel: channelId, text });
+  if (!response || typeof response !== "object" || !("ts" in response) || typeof response.ts !== "string") {
+    throw new Error("Slack chat.postMessage did not return a message timestamp.");
+  }
+  return { ts: response.ts };
 }
 
 async function handleParsedCommand(input: {

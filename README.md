@@ -65,29 +65,28 @@ pi session files are managed by the pi SDK for each project cwd.
 
 ## Slack behavior
 
-In registered project channels, top-level messages from the allowed Slack user create or reuse a workflow for that message's thread without mentioning the bot:
+In registered project channels, top-level messages from the allowed Slack user create or reuse a workflow for that message's thread, with or without mentioning the bot:
 
 ```text
-/plan Add an operations dashboard
+plan Add an operations dashboard
 hello from top level
+@rossbot plan Add an operations dashboard
 ```
 
-Top-level app mentions also create or reuse a workflow for that thread:
+Accepted top-level messages get a single status reaction that is updated as the queued work progresses: `:eyes:` accepted/queued, `:rocket:` running, `:white_check_mark:` completed, or `:x:` failed. Reaction updates are best-effort UI hints; failures are logged without changing workflow behavior.
 
-```text
-@rossbot /plan Add an operations dashboard
-```
-
-Thread replies are routed only when a workflow already exists for that Slack thread. Separate Slack threads map to separate pi sessions and can run concurrently; messages inside one thread are queued serially. Messages from other human users are ignored and logged without a Slack reply.
+Thread replies are routed only when a workflow already exists for that Slack thread. Accepted thread replies get a transient `:hourglass_flowing_sand:` reaction while the agent is processing the message, then the reaction is removed. Separate Slack threads map to separate pi sessions and can run concurrently; messages inside one thread are queued serially. Messages from other human users are ignored and logged without a Slack reply.
 
 Commands:
 
-- `/plan <topic>` — loads and follows Ross's `ross-plan` skill. Replies include Obsidian deep links when they mention handoff plans under `~/notes/my-brain/20 Projects/<repo>/plans/`.
-- `/implement [request]` — loads and follows Ross's `implement` skill.
-- `/pr [request]` — loads and follows Ross's `commit-pr` skill.
-- `/status` — prints workflow metadata.
-- `/close` — marks the workflow closed and disposes the loaded session.
-- `/reset` — creates a fresh pi session for the same Slack thread.
+- `plan <topic>` or `/plan <topic>` — loads and follows Ross's `ross-plan` skill. Replies include Obsidian deep links when they mention handoff plans under `~/notes/my-brain/20 Projects/<repo>/plans/`.
+- `implement [request]` or `/implement [request]` — loads and follows Ross's `implement` skill.
+- `pr [request]` or `/pr [request]` — loads and follows Ross's `commit-pr` skill.
+- `status` — prints workflow metadata.
+- `close` — marks the workflow closed and disposes the loaded session.
+- `reset` — creates a fresh pi session for the same Slack thread.
+
+Registered Slack slash commands are supported for `/plan`, `/implement`, and `/pr`. Slash command invocations post a new top-level rossbot message and run the workflow in that message's thread.
 
 Plain top-level messages and thread replies are sent directly to the corresponding pi session as follow-up prompts.
 
