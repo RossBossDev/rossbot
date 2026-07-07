@@ -1,6 +1,7 @@
 import { App, LogLevel } from "@slack/bolt";
 import type { ProjectConfig, RossbotConfig, SlackEnv, WorkflowRecord } from "./types.js";
 import { parseCommand } from "./commands.js";
+import { appendObsidianPlanLinks } from "./obsidian-links.js";
 import { enqueue, PiHostRunner } from "./pi-host-runner.js";
 import { workflowKey } from "./workflow-store.js";
 
@@ -126,7 +127,11 @@ async function handleParsedCommand(input: {
       await input.runner.reset({ workflow: input.workflow });
       await postThreadReply(input.client, input.channelId, input.threadTs, "Workflow reset with a fresh pi session.");
       return;
-    case "plan":
+    case "plan": {
+      const response = await input.runner.send({ workflow: input.workflow, command: input.command });
+      await postThreadReply(input.client, input.channelId, input.threadTs, appendObsidianPlanLinks(response.text));
+      return;
+    }
     case "implement":
     case "pr":
     case "followUp": {

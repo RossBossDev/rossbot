@@ -11,12 +11,24 @@ pnpm install
 Required environment variables:
 
 ```bash
-export SLACK_BOT_TOKEN=xoxb-...
-export SLACK_APP_TOKEN=xapp-...
-export SLACK_BOT_USER_ID=U...
+export ROSSBOT_TOKEN=xoxb-...
+export ROSSBOT_APP_TOKEN=xapp-...
+export ROSSBOT_USER_ID=U...
 ```
 
-Rossbot defaults to `~/.rossbot/config.json`. You can override it with `--config`.
+Rossbot defaults to `~/.rossbot/config.json`. You can override it with `--config` when starting the daemon.
+
+## Project onboarding
+
+From the git repo root for a project Rossbot should manage, run:
+
+```bash
+pnpm dev -- project add
+# or, after build/install:
+rossbot project add
+```
+
+The onboarding command derives the project id, name, and cwd from the current repo root, then helps select or create a public Slack channel. It writes to `~/.rossbot/config.json`.
 
 Example config:
 
@@ -38,7 +50,7 @@ Each project `cwd` must exist. Project ids and Slack channel ids must be unique.
 ## Run
 
 ```bash
-pnpm dev -- --config ~/.rossbot/config.json
+pnpm dev -- start --config ~/.rossbot/config.json
 ```
 
 The daemon uses Slack Socket Mode and stores workflow records in:
@@ -61,7 +73,7 @@ Thread replies are routed only when a workflow already exists for that Slack thr
 
 Commands:
 
-- `/plan <topic>` — loads and follows Ross's `ross-plan` skill.
+- `/plan <topic>` — loads and follows Ross's `ross-plan` skill. Replies include Obsidian deep links when they mention handoff plans under `~/notes/my-brain/20 Projects/<repo>/plans/`.
 - `/implement [request]` — loads and follows Ross's `implement` skill.
 - `/pr [request]` — loads and follows Ross's `commit-pr` skill.
 - `/status` — prints workflow metadata.
@@ -74,4 +86,5 @@ Plain thread replies are sent directly to the same pi session as follow-up promp
 
 ```bash
 pnpm typecheck
+pnpm build
 ```

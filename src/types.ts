@@ -19,6 +19,13 @@ export type SlackEnv = {
   botUserId: string;
 };
 
+export type CliCommand = { command: "start"; configPath: string } | { command: "projectAdd" };
+
+export type SlackChannelSummary = {
+  id: string;
+  name: string;
+};
+
 export type WorkflowStatus = "idle" | "running" | "failed" | "closed";
 
 export type WorkflowRecord = {

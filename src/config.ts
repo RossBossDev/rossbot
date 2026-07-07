@@ -2,14 +2,26 @@ import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { resolve } from "node:path";
 import "dotenv/config";
-import type { ProjectConfig, RossbotConfig, SlackEnv } from "./types.js";
+import type { CliCommand, ProjectConfig, RossbotConfig, SlackEnv } from "./types.js";
 
 export const defaultConfigPath = resolve(homedir(), ".rossbot/config.json");
 
-export function parseCliArgs(argv: string[]): { command: "start"; configPath: string } {
+export function parseCliArgs(argv: string[]): CliCommand {
   const [command = "start", ...rest] = argv;
+
+  if (command === "project") {
+    const [subcommand, ...projectRest] = rest;
+    if (subcommand !== "add") {
+      throw new Error(`Unsupported project command: ${subcommand ?? ""}. Expected "project add".`);
+    }
+    if (projectRest.length > 0) {
+      throw new Error("rossbot project add does not accept arguments");
+    }
+    return { command: "projectAdd" };
+  }
+
   if (command !== "start") {
-    throw new Error(`Unsupported command: ${command}. Expected "start".`);
+    throw new Error(`Unsupported command: ${command}. Expected "start" or "project add".`);
   }
 
   let configPath = defaultConfigPath;
@@ -54,7 +66,11 @@ export function loadConfig(configPath: string): RossbotConfig {
     throw new Error(`Config file not found: ${configPath}`);
   }
 
-  const raw = JSON.parse(readFileSync(configPath, "utf8")) as unknown;
+  return parseConfig(readFileSync(configPath, "utf8"));
+}
+
+export function parseConfig(rawConfig: string): RossbotConfig {
+  const raw = JSON.parse(rawConfig) as unknown;
   if (!isConfig(raw)) {
     throw new Error("Config must be an object with a projects array");
   }
@@ -71,7 +87,7 @@ function isConfig(value: unknown): value is RossbotConfig {
   );
 }
 
-function validateProjects(projects: ProjectConfig[]): void {
+export function validateProjects(projects: ProjectConfig[]): void {
   const ids = new Set<string>();
   const channelIds = new Set<string>();
 
