@@ -73,7 +73,7 @@ hello from top level
 @rossbot plan Add an operations dashboard
 ```
 
-Accepted top-level messages get a single status reaction that is updated as the queued work progresses: `:eyes:` accepted/queued, `:rocket:` running, `:white_check_mark:` completed, or `:x:` failed. Reaction updates are best-effort UI hints; failures are logged without changing workflow behavior.
+Accepted top-level messages get a single status reaction that is updated as the queued work progresses: `:eyes:` accepted/queued, `:white_check_mark:` completed, or `:x:` failed. Reaction updates are best-effort UI hints; failures are logged without changing workflow behavior.
 
 Thread replies are routed only when a workflow already exists for that Slack thread. Accepted thread replies get a transient `:hourglass_flowing_sand:` reaction while the agent is processing the message, then the reaction is removed. Separate Slack threads map to separate pi sessions and can run concurrently; messages inside one thread are queued serially. Messages from other human users are ignored and logged without a Slack reply.
 

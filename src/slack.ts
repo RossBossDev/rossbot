@@ -68,6 +68,7 @@ export async function startSlackApp(input: {
       const parsedCommand = parseSlashCommand(command.command, command.text ?? "");
       const parent = await postTopLevelMessage(client, channelId, formatSlashCommandParentMessage(parsedCommand));
       const threadTs = parent.ts;
+      await setStatusReaction(client, logger, { channel: channelId, timestamp: threadTs, to: "eyes" });
       const workflow = await input.runner.getOrCreateWorkflow({ project, channelId, threadTs });
 
       await enqueue(workflow, async () => {
@@ -80,7 +81,9 @@ export async function startSlackApp(input: {
             channelId,
             threadTs,
           });
+          await setStatusReaction(client, logger, { channel: channelId, timestamp: threadTs, to: "white_check_mark" });
         } catch (error) {
+          await setStatusReaction(client, logger, { channel: channelId, timestamp: threadTs, to: "x" });
           logger.error(error);
           await postThreadReply(client, channelId, threadTs, formatError(error));
         }
@@ -258,8 +261,15 @@ function parseSlashCommand(command: string, text: string): Extract<ReturnType<ty
 }
 
 function formatSlashCommandParentMessage(command: ReturnType<typeof parseSlashCommand>): string {
-  const args = command.args ? ` ${command.args}` : "";
-  return `rossbot queued /${command.type}${args}`;
+  const target = command.args ? ` for ${command.args}` : "";
+  switch (command.type) {
+    case "plan":
+      return `Creating concrete plan${target}`;
+    case "implement":
+      return `Implementing ${command.args ?? "next plan"}`;
+    case "pr":
+      return `Preparing pull request${target}`;
+  }
 }
 
 async function postTopLevelMessage(
