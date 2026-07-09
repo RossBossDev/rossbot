@@ -7,8 +7,10 @@ INSTALL_DIR="${ROSSBOT_INSTALL_DIR:-$HOME/.rossbot/app}"
 CONFIG_PATH="${ROSSBOT_CONFIG_PATH:-$HOME/.rossbot/config.json}"
 ENV_PATH="${ROSSBOT_ENV_PATH:-$HOME/.rossbot/env}"
 LOG_DIR="${ROSSBOT_LOG_DIR:-$HOME/.rossbot/logs}"
+BIN_DIR="${ROSSBOT_BIN_DIR:-$HOME/.local/bin}"
 PLIST_PATH="$HOME/Library/LaunchAgents/$LABEL.plist"
 RUN_SCRIPT="$INSTALL_DIR/bin/run-$APP_NAME.sh"
+CLI_SCRIPT="$BIN_DIR/$APP_NAME"
 SOURCE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 if [[ "$(uname -s)" != "Darwin" ]]; then
@@ -27,7 +29,7 @@ if ! command -v pnpm >/dev/null 2>&1; then
   exit 1
 fi
 
-mkdir -p "$INSTALL_DIR" "$LOG_DIR" "$(dirname "$PLIST_PATH")"
+mkdir -p "$INSTALL_DIR" "$LOG_DIR" "$BIN_DIR" "$(dirname "$PLIST_PATH")"
 
 rsync -a --delete \
   --exclude ".git" \
@@ -55,6 +57,21 @@ cd "$INSTALL_DIR"
 exec node "$INSTALL_DIR/dist/cli.js" start --config "$CONFIG_PATH"
 EOF
 chmod +x "$RUN_SCRIPT"
+
+cat > "$CLI_SCRIPT" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ -f "$ENV_PATH" ]]; then
+  set -a
+  # shellcheck disable=SC1090
+  source "$ENV_PATH"
+  set +a
+fi
+
+exec node "$INSTALL_DIR/dist/cli.js" "\$@"
+EOF
+chmod +x "$CLI_SCRIPT"
 
 cat > "$PLIST_PATH" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -96,3 +113,4 @@ echo "$APP_NAME installed to $INSTALL_DIR and loaded as $LABEL"
 echo "Config: $CONFIG_PATH"
 echo "Env: $ENV_PATH"
 echo "Logs: $LOG_DIR"
+echo "CLI: $CLI_SCRIPT"
