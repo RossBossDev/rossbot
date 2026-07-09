@@ -3,6 +3,7 @@ import { resolve } from "node:path";
 import { App, LogLevel } from "@slack/bolt";
 import type { ProjectConfig, RossbotConfig, RunnerAttachment, SlackEnv, WorkflowRecord } from "./types.js";
 import { normalizeSlackText, parseCommand } from "./commands.js";
+import { errorContext, logDebug, logError, logInfo, logWarn } from "./logger.js";
 import { appendObsidianPlanLinks } from "./obsidian-links.js";
 import { enqueue, PiHostRunner } from "./pi-host-runner.js";
 import {
@@ -69,6 +70,7 @@ export async function startSlackApp(input: {
   env: SlackEnv;
   runner: PiHostRunner;
 }): Promise<void> {
+  logInfo("Starting Slack app", { projectCount: input.config.projects.length });
   const app = new App({
     token: input.env.botToken,
     appToken: input.env.appToken,
@@ -80,10 +82,18 @@ export async function startSlackApp(input: {
     app.command(slashCommand, async ({ command, ack, client, logger, respond }) => {
       await ack();
 
+      logInfo("Received Slack slash command", {
+        command: command.command,
+        channelId: command.channel_id,
+        userId: command.user_id,
+        textLength: command.text?.length ?? 0,
+      });
+
       if (command.user_id !== input.env.allowedUserId) {
         logger.warn(
           `Ignoring unauthorized Slack slash command from user ${command.user_id} in channel ${command.channel_id}`,
         );
+        logWarn("Ignoring unauthorized Slack slash command", { userId: command.user_id, channelId: command.channel_id });
         await respond({ response_type: "ephemeral", text: "You are not authorized to use rossbot." });
         return;
       }
@@ -91,11 +101,17 @@ export async function startSlackApp(input: {
       const channelId = command.channel_id;
       const project = findProject(input.config, channelId);
       if (!project) {
+        logWarn("Ignoring slash command for unregistered channel", { channelId });
         await respond({ response_type: "ephemeral", text: "This channel is not registered with rossbot." });
         return;
       }
 
       const parsedCommand = parseSlashCommand(command.command, command.text ?? "");
+      logInfo("Creating parent Slack message for slash command", {
+        channelId,
+        projectId: project.id,
+        commandType: parsedCommand.type,
+      });
       const parent = await postTopLevelMessage(client, channelId, formatSlashCommandParentMessage(parsedCommand));
       const threadTs = parent.ts;
       await setStatusReaction(client, logger, { channel: channelId, timestamp: threadTs, to: "eyes" });
@@ -115,6 +131,7 @@ export async function startSlackApp(input: {
         } catch (error) {
           await setStatusReaction(client, logger, { channel: channelId, timestamp: threadTs, to: "x" });
           logger.error(error);
+          logError("Slash command workflow failed", { channelId, threadTs, projectId: project.id, ...errorContext(error) });
           await postThreadReply(client, channelId, threadTs, formatError(error));
         }
       });
@@ -123,15 +140,34 @@ export async function startSlackApp(input: {
 
   app.message(async ({ message, client, logger }) => {
     const slackEvent = message as SlackEvent;
+    logDebug("Received Slack message event", {
+      channelId: slackEvent.channel,
+      userId: slackEvent.user,
+      ts: slackEvent.ts,
+      threadTs: slackEvent.thread_ts,
+      channelType: slackEvent.channel_type,
+      hasText: Boolean(slackEvent.text),
+      fileCount: slackEvent.files?.length ?? 0,
+      hasBotId: Boolean(slackEvent.bot_id),
+    });
     if (!isAuthorized(slackEvent, input.env, logger)) return;
-    if (!slackEvent.channel || !slackEvent.ts) return;
-    if (!slackEvent.text && !slackEvent.files?.length) return;
+    if (!slackEvent.channel || !slackEvent.ts) {
+      logDebug("Ignoring Slack message missing channel or timestamp");
+      return;
+    }
+    if (!slackEvent.text && !slackEvent.files?.length) {
+      logDebug("Ignoring Slack message with no text or files", { channelId: slackEvent.channel, ts: slackEvent.ts });
+      return;
+    }
 
     const channelId = slackEvent.channel;
     const messageTs = slackEvent.ts;
     const isDm = isDirectMessage(slackEvent);
     const project = isDm ? personalAgentProject(channelId) : findProject(input.config, channelId);
-    if (!project) return;
+    if (!project) {
+      logDebug("Ignoring Slack message for unregistered channel", { channelId });
+      return;
+    }
 
     const isTopLevel = !slackEvent.thread_ts;
     const replyThreadTs = isDm ? undefined : (slackEvent.thread_ts ?? messageTs);
@@ -146,7 +182,10 @@ export async function startSlackApp(input: {
           })
         : await input.runner.getOrCreateWorkflow({ project, channelId, threadTs: workflowThreadTs });
 
-    if (!workflow || workflow.record.key !== workflowKey(channelId, workflowThreadTs)) return;
+    if (!workflow || workflow.record.key !== workflowKey(channelId, workflowThreadTs)) {
+      logDebug("Ignoring Slack reply without existing workflow", { channelId, threadTs: workflowThreadTs, projectId: project.id });
+      return;
+    }
     if (workflow.record.status === "closed") {
       const command = isDm
         ? parsePersonalAgentCommand(slackEvent.text ?? "", input.env.botUserId)
@@ -165,6 +204,17 @@ export async function startSlackApp(input: {
     const command = isDm
       ? parsePersonalAgentCommand(slackEvent.text ?? "", input.env.botUserId)
       : parseCommand(slackEvent.text ?? "", input.env.botUserId);
+    logInfo("Routing Slack message to workflow", {
+      channelId,
+      messageTs,
+      workflowThreadTs,
+      projectId: project.id,
+      isDm,
+      isTopLevel,
+      commandType: command.type,
+      workflowStatus: workflow.record.status,
+      fileCount: slackEvent.files?.length ?? 0,
+    });
     const attachmentResult = slackEvent.files?.length
       ? await downloadSlackAttachments({
           botToken: input.env.botToken,
@@ -174,6 +224,17 @@ export async function startSlackApp(input: {
           files: slackEvent.files,
         })
       : { accepted: [], ignored: [] };
+
+    if (attachmentResult.accepted.length || attachmentResult.ignored.length) {
+      logInfo("Slack attachments processed", {
+        channelId,
+        messageTs,
+        projectId: project.id,
+        acceptedCount: attachmentResult.accepted.length,
+        ignoredCount: attachmentResult.ignored.length,
+        ignored: attachmentResult.ignored,
+      });
+    }
 
     if (attachmentResult.ignored.length) {
       await postThreadReply(
@@ -212,6 +273,7 @@ export async function startSlackApp(input: {
           await setStatusReaction(client, logger, { channel: channelId, timestamp: messageTs, to: "x" });
         }
         logger.error(error);
+        logError("Slack message workflow failed", { channelId, threadTs: replyThreadTs, projectId: project.id, ...errorContext(error) });
         await postThreadReply(client, channelId, replyThreadTs, formatError(error));
       } finally {
         if (!isTopLevel) {
@@ -222,7 +284,7 @@ export async function startSlackApp(input: {
   });
 
   await app.start();
-  console.log("rossbot Slack Socket Mode app started");
+  logInfo("Rossbot Slack Socket Mode app started");
 }
 
 async function setStatusReaction(
@@ -247,11 +309,18 @@ async function removeReaction(
     const code = slackErrorCode(error);
     if (code === "no_reaction" || code === "not_reacted") {
       logger.debug?.(`Slack status reaction ${input.name} was not present on ${input.channel}/${input.timestamp}`);
+      logDebug("Slack reaction not present", { channelId: input.channel, timestamp: input.timestamp, reaction: input.name });
       return;
     }
     logger.warn(
       `Unable to remove Slack status reaction ${input.name} from ${input.channel}/${input.timestamp}: ${formatSlackError(error)}`,
     );
+    logWarn("Unable to remove Slack reaction", {
+      channelId: input.channel,
+      timestamp: input.timestamp,
+      reaction: input.name,
+      slackError: formatSlackError(error),
+    });
   }
 }
 
@@ -266,11 +335,18 @@ async function addReaction(
     const code = slackErrorCode(error);
     if (code === "already_reacted") {
       logger.debug?.(`Slack status reaction ${input.name} already present on ${input.channel}/${input.timestamp}`);
+      logDebug("Slack reaction already present", { channelId: input.channel, timestamp: input.timestamp, reaction: input.name });
       return;
     }
     logger.warn(
       `Unable to add Slack status reaction ${input.name} to ${input.channel}/${input.timestamp}: ${formatSlackError(error)}`,
     );
+    logWarn("Unable to add Slack reaction", {
+      channelId: input.channel,
+      timestamp: input.timestamp,
+      reaction: input.name,
+      slackError: formatSlackError(error),
+    });
   }
 }
 
@@ -299,6 +375,11 @@ function isAuthorized(
   logger.warn(
     `Ignoring unauthorized Slack message from user ${event.user} in channel ${event.channel ?? "unknown"} at ${event.ts ?? "unknown"}`,
   );
+  logWarn("Ignoring unauthorized Slack message", {
+    userId: event.user,
+    channelId: event.channel ?? "unknown",
+    ts: event.ts ?? "unknown",
+  });
   return false;
 }
 

@@ -10,6 +10,7 @@ import type {
   WorkflowRecord,
   WorkflowRuntime,
 } from "./types.js";
+import { errorContext, logDebug, logError, logInfo } from "./logger.js";
 import { WorkflowStore, workflowKey } from "./workflow-store.js";
 
 export class PiHostRunner implements AgentRunner {
@@ -24,10 +25,17 @@ export class PiHostRunner implements AgentRunner {
   }): Promise<WorkflowRuntime | undefined> {
     const key = workflowKey(input.channelId, input.threadTs);
     const cached = this.workflows.get(key);
-    if (cached) return cached;
+    if (cached) {
+      logDebug("Workflow cache hit", { key, projectId: cached.record.projectId, status: cached.record.status });
+      return cached;
+    }
 
     const existing = await this.store.find(key);
-    if (!existing) return undefined;
+    if (!existing) {
+      logDebug("Workflow not found", { key, projectId: input.project.id });
+      return undefined;
+    }
+    logInfo("Workflow restored from store", { key, projectId: existing.projectId, status: existing.status });
     return this.materializeWorkflow(input.project, input.channelId, input.threadTs, existing);
   }
 
@@ -47,8 +55,17 @@ export class PiHostRunner implements AgentRunner {
   ): Promise<WorkflowRuntime> {
     const key = workflowKey(channelId, threadTs);
     const cached = this.workflows.get(key);
-    if (cached) return cached;
+    if (cached) {
+      logDebug("Workflow materialize cache hit", { key, projectId: cached.record.projectId, status: cached.record.status });
+      return cached;
+    }
 
+    logInfo(existing ? "Opening existing workflow session" : "Creating workflow session", {
+      key,
+      projectId: project.id,
+      cwd: project.cwd,
+      hasSessionFile: Boolean(existing?.sessionFile),
+    });
     const session = await this.openSession(project, existing?.sessionFile);
     const now = new Date().toISOString();
     const record: WorkflowRecord = existing ?? {
@@ -69,6 +86,13 @@ export class PiHostRunner implements AgentRunner {
     record.sessionFile = session.sessionFile;
     record.updatedAt = now;
     await this.store.upsert(record);
+    logInfo("Workflow materialized", {
+      key,
+      projectId: project.id,
+      status: record.status,
+      sessionId: record.sessionId,
+      hasSessionFile: Boolean(record.sessionFile),
+    });
 
     const runtime: WorkflowRuntime = { project, record, session, queue: Promise.resolve() };
     this.workflows.set(key, runtime);
@@ -79,6 +103,15 @@ export class PiHostRunner implements AgentRunner {
     const workflow = input.workflow;
     const prompt = commandToPrompt(input.command);
     const images = await attachmentsToNativeImages(input.command.attachments);
+
+    logInfo("Sending command to pi session", {
+      key: workflow.record.key,
+      projectId: workflow.record.projectId,
+      commandType: input.command.type,
+      attachmentCount: input.command.attachments?.length ?? 0,
+      nativeImageCount: images.length,
+      promptLength: prompt.length,
+    });
 
     workflow.record.status = "running";
     workflow.record.lastError = undefined;
@@ -106,12 +139,24 @@ export class PiHostRunner implements AgentRunner {
       workflow.record.sessionFile = workflow.session.sessionFile;
       workflow.record.updatedAt = new Date().toISOString();
       await this.store.upsert(workflow.record);
-      return { text: text.trim() || finalAssistantText.trim() || "Done." };
+      const responseText = text.trim() || finalAssistantText.trim() || "Done.";
+      logInfo("Pi session command completed", {
+        key: workflow.record.key,
+        projectId: workflow.record.projectId,
+        responseLength: responseText.length,
+        sessionId: workflow.record.sessionId,
+      });
+      return { text: responseText };
     } catch (error) {
       workflow.record.status = "failed";
       workflow.record.lastError = error instanceof Error ? error.message : String(error);
       workflow.record.updatedAt = new Date().toISOString();
       await this.store.upsert(workflow.record);
+      logError("Pi session command failed", {
+        key: workflow.record.key,
+        projectId: workflow.record.projectId,
+        ...errorContext(error),
+      });
       throw error;
     } finally {
       unsubscribe();
@@ -119,6 +164,7 @@ export class PiHostRunner implements AgentRunner {
   }
 
   async reset(input: { workflow: WorkflowRuntime }): Promise<WorkflowRuntime> {
+    logInfo("Resetting workflow", { key: input.workflow.record.key, projectId: input.workflow.record.projectId });
     input.workflow.session.dispose();
     const session = await this.openSession(input.workflow.project);
     const now = new Date().toISOString();
@@ -130,10 +176,16 @@ export class PiHostRunner implements AgentRunner {
     input.workflow.session = session;
     input.workflow.queue = Promise.resolve();
     await this.store.upsert(input.workflow.record);
+    logInfo("Workflow reset", {
+      key: input.workflow.record.key,
+      projectId: input.workflow.record.projectId,
+      sessionId: input.workflow.record.sessionId,
+    });
     return input.workflow;
   }
 
   async close(input: { workflow: WorkflowRuntime }): Promise<void> {
+    logInfo("Closing workflow", { key: input.workflow.record.key, projectId: input.workflow.record.projectId });
     input.workflow.record.status = "closed";
     input.workflow.record.updatedAt = new Date().toISOString();
     await this.store.upsert(input.workflow.record);
@@ -142,6 +194,12 @@ export class PiHostRunner implements AgentRunner {
   }
 
   private async openSession(project: ProjectConfig, sessionFile?: string): Promise<AgentSession> {
+    logInfo(sessionFile ? "Opening pi session from file" : "Creating new pi session", {
+      projectId: project.id,
+      cwd: project.cwd,
+      hasAppendSystemPrompt: Boolean(project.appendSystemPrompt),
+      hasSessionFile: Boolean(sessionFile),
+    });
     const sessionManager = sessionFile
       ? SessionManager.open(sessionFile, undefined, project.cwd)
       : SessionManager.create(project.cwd);
@@ -164,8 +222,33 @@ export class PiHostRunner implements AgentRunner {
 }
 
 export function enqueue(workflow: WorkflowRuntime, task: () => Promise<void>): Promise<void> {
-  workflow.queue = workflow.queue.then(task, task);
+  const queuedAt = Date.now();
+  logDebug("Queueing workflow task", { key: workflow.record.key, projectId: workflow.record.projectId });
+  workflow.queue = workflow.queue.then(
+    () => runQueuedTask(workflow, task, queuedAt, false),
+    () => runQueuedTask(workflow, task, queuedAt, true),
+  );
   return workflow.queue;
+}
+
+async function runQueuedTask(
+  workflow: WorkflowRuntime,
+  task: () => Promise<void>,
+  queuedAt: number,
+  previousFailed: boolean,
+): Promise<void> {
+  logInfo(previousFailed ? "Starting workflow task after previous queue failure" : "Starting workflow task", {
+    key: workflow.record.key,
+    projectId: workflow.record.projectId,
+    queuedMs: Date.now() - queuedAt,
+  });
+  try {
+    await task();
+    logInfo("Workflow task completed", { key: workflow.record.key, projectId: workflow.record.projectId });
+  } catch (error) {
+    logError("Workflow task failed", { key: workflow.record.key, projectId: workflow.record.projectId, ...errorContext(error) });
+    throw error;
+  }
 }
 
 function commandToPrompt(command: RunnerCommand): string {

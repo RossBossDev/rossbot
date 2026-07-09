@@ -1,5 +1,6 @@
 import { mkdir, writeFile } from "node:fs/promises";
 import { basename, extname, join } from "node:path";
+import { logDebug, logInfo, logWarn } from "./logger.js";
 import type { RunnerAttachment } from "./types.js";
 
 export type SlackFileAttachment = {
@@ -72,6 +73,11 @@ export async function downloadSlackAttachments(input: {
 }): Promise<AttachmentDownloadResult> {
   const accepted: RunnerAttachment[] = [];
   const ignored: string[] = [];
+  logInfo("Processing Slack attachments", {
+    channelId: input.channelId,
+    messageTs: input.messageTs,
+    fileCount: input.files.length,
+  });
 
   for (const file of input.files.slice(0, maxAttachmentsPerMessage)) {
     const filename = safeFilename(file.name || file.title || file.id);
@@ -79,34 +85,41 @@ export async function downloadSlackAttachments(input: {
 
     if (!allowedAttachmentExtensions.has(extension)) {
       ignored.push(`${filename} (unsupported extension)`);
+      logDebug("Ignoring Slack attachment with unsupported extension", { filename, extension });
       continue;
     }
 
     if (file.size !== undefined && file.size > maxAttachmentBytes) {
       ignored.push(`${filename} (larger than ${formatBytes(maxAttachmentBytes)})`);
+      logDebug("Ignoring Slack attachment over size limit before download", { filename, size: file.size });
       continue;
     }
 
     const downloadUrl = file.url_private_download ?? file.url_private;
     if (!downloadUrl) {
       ignored.push(`${filename} (no private download URL)`);
+      logWarn("Ignoring Slack attachment without download URL", { filename });
       continue;
     }
 
     let bytes: Buffer;
     try {
+      logDebug("Downloading Slack attachment", { filename, size: file.size, mimetype: file.mimetype });
       const response = await fetch(downloadUrl, { headers: { authorization: `Bearer ${input.botToken}` } });
       if (!response.ok) {
         ignored.push(`${filename} (download failed: HTTP ${response.status})`);
+        logWarn("Slack attachment download failed", { filename, httpStatus: response.status });
         continue;
       }
       bytes = Buffer.from(await response.arrayBuffer());
     } catch (error) {
       ignored.push(`${filename} (download failed: ${error instanceof Error ? error.message : String(error)})`);
+      logWarn("Slack attachment download threw", { filename, errorMessage: error instanceof Error ? error.message : String(error) });
       continue;
     }
     if (bytes.byteLength > maxAttachmentBytes) {
       ignored.push(`${filename} (larger than ${formatBytes(maxAttachmentBytes)})`);
+      logDebug("Ignoring Slack attachment over size limit after download", { filename, size: bytes.byteLength });
       continue;
     }
 
@@ -124,13 +137,26 @@ export async function downloadSlackAttachments(input: {
       size: bytes.byteLength,
       nativeImage: nativeImageMediaTypes.has(extension),
     });
+    logInfo("Slack attachment saved", {
+      filename: outputFilename,
+      path: outputPath,
+      size: bytes.byteLength,
+      nativeImage: nativeImageMediaTypes.has(extension),
+    });
   }
 
   const extraCount = input.files.length - maxAttachmentsPerMessage;
   if (extraCount > 0) {
     ignored.push(`${extraCount} additional attachment(s) (limit is ${maxAttachmentsPerMessage} per message)`);
+    logWarn("Slack attachment count exceeded limit", { fileCount: input.files.length, maxAttachmentsPerMessage });
   }
 
+  logInfo("Finished processing Slack attachments", {
+    channelId: input.channelId,
+    messageTs: input.messageTs,
+    acceptedCount: accepted.length,
+    ignoredCount: ignored.length,
+  });
   return { accepted, ignored };
 }
 

@@ -2,6 +2,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { resolve } from "node:path";
 import "dotenv/config";
+import { logDebug, logInfo } from "./logger.js";
 import type { CliCommand, ProjectConfig, RossbotConfig, SlackEnv } from "./types.js";
 
 export const defaultConfigPath = resolve(homedir(), ".rossbot/config.json");
@@ -67,6 +68,12 @@ export function loadSlackEnv(env = process.env): SlackEnv {
     throw new Error(`Missing required env vars: ${missing.join(", ")}`);
   }
 
+  logDebug("Slack environment loaded", {
+    botUserId,
+    allowedUserId,
+    onboardingUserIdCount: onboardingUserIds.length,
+  });
+
   return { botToken: botToken!, appToken: appToken!, botUserId: botUserId!, allowedUserId, onboardingUserIds };
 }
 
@@ -80,6 +87,7 @@ export function loadConfig(configPath: string): RossbotConfig {
     throw new Error(`Config file not found: ${configPath}`);
   }
 
+  logDebug("Reading Rossbot config file", { configPath });
   return parseConfig(readFileSync(configPath, "utf8"));
 }
 
@@ -90,6 +98,7 @@ export function parseConfig(rawConfig: string): RossbotConfig {
   }
 
   validateProjects(raw.projects);
+  logInfo("Rossbot config parsed", { projectCount: raw.projects.length });
   return raw;
 }
 
