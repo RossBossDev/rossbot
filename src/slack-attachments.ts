@@ -103,18 +103,30 @@ export async function downloadSlackAttachments(input: {
     }
 
     let bytes: Buffer;
+    let responseContentType: string | undefined;
     try {
       logDebug("Downloading Slack attachment", { filename, size: file.size, mimetype: file.mimetype });
-      const response = await fetch(downloadUrl, { headers: { authorization: `Bearer ${input.botToken}` } });
+      const response = await fetchSlackAttachment(downloadUrl, input.botToken);
       if (!response.ok) {
         ignored.push(`${filename} (download failed: HTTP ${response.status})`);
-        logWarn("Slack attachment download failed", { filename, httpStatus: response.status });
+        logWarn("Slack attachment download failed", { filename, httpStatus: response.status, finalUrl: response.url });
         continue;
       }
+      responseContentType = response.headers.get("content-type") ?? undefined;
       bytes = Buffer.from(await response.arrayBuffer());
     } catch (error) {
       ignored.push(`${filename} (download failed: ${error instanceof Error ? error.message : String(error)})`);
       logWarn("Slack attachment download threw", { filename, errorMessage: error instanceof Error ? error.message : String(error) });
+      continue;
+    }
+    if (looksLikeHtml(bytes, responseContentType)) {
+      ignored.push(`${filename} (download returned HTML instead of the file; check Slack file permissions/scopes)`);
+      logWarn("Slack attachment download returned HTML", { filename, contentType: responseContentType, size: bytes.byteLength });
+      continue;
+    }
+    if (nativeImageMediaTypes.has(extension) && !isValidImageBytes(bytes, extension)) {
+      ignored.push(`${filename} (downloaded content is not a valid ${extension} image)`);
+      logWarn("Slack image attachment failed signature validation", { filename, extension, contentType: responseContentType, size: bytes.byteLength });
       continue;
     }
     if (bytes.byteLength > maxAttachmentBytes) {
@@ -181,8 +193,50 @@ function uniqueFilename(filename: string, accepted: RunnerAttachment[]): string 
   return `${stem}-${index}${extension}`;
 }
 
+async function fetchSlackAttachment(downloadUrl: string, botToken: string): Promise<Response> {
+  let url = downloadUrl;
+  for (let redirectCount = 0; redirectCount <= 5; redirectCount += 1) {
+    const response = await fetch(url, {
+      headers: { authorization: `Bearer ${botToken}` },
+      redirect: "manual",
+    });
+
+    if (!isRedirect(response.status)) return response;
+
+    const location = response.headers.get("location");
+    if (!location) return response;
+    url = new URL(location, url).toString();
+  }
+
+  throw new Error("too many redirects while downloading Slack attachment");
+}
+
+function isRedirect(status: number): boolean {
+  return status >= 300 && status < 400;
+}
+
+function looksLikeHtml(bytes: Buffer, contentType: string | undefined): boolean {
+  if (contentType?.toLowerCase().includes("text/html")) return true;
+  const prefix = bytes.subarray(0, 64).toString("utf8").trimStart().toLowerCase();
+  return prefix.startsWith("<!doctype html") || prefix.startsWith("<html");
+}
+
+function isValidImageBytes(bytes: Buffer, extension: string): boolean {
+  switch (extension) {
+    case ".png":
+      return bytes.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]));
+    case ".jpg":
+    case ".jpeg":
+      return bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff;
+    case ".webp":
+      return bytes.subarray(0, 4).toString("ascii") === "RIFF" && bytes.subarray(8, 12).toString("ascii") === "WEBP";
+    default:
+      return true;
+  }
+}
+
 function normalizeMediaType(mimetype: string | undefined, extension: string): string | undefined {
-  return mimetype ?? nativeImageMediaTypes.get(extension);
+  return nativeImageMediaTypes.get(extension) ?? mimetype;
 }
 
 function formatBytes(bytes: number): string {
