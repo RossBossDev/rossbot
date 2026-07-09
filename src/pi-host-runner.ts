@@ -86,9 +86,16 @@ export class PiHostRunner implements AgentRunner {
     await this.store.upsert(workflow.record);
 
     let text = "";
+    let finalAssistantText = "";
     const unsubscribe = workflow.session.subscribe((event) => {
       if (event.type === "message_update" && event.assistantMessageEvent.type === "text_delta") {
         text += event.assistantMessageEvent.delta;
+      }
+      if (event.type === "message_end") {
+        finalAssistantText = extractAssistantText(event.message) || finalAssistantText;
+      }
+      if (event.type === "turn_end") {
+        finalAssistantText = extractAssistantText(event.message) || finalAssistantText;
       }
     });
 
@@ -99,7 +106,7 @@ export class PiHostRunner implements AgentRunner {
       workflow.record.sessionFile = workflow.session.sessionFile;
       workflow.record.updatedAt = new Date().toISOString();
       await this.store.upsert(workflow.record);
-      return { text: text.trim() || "Done." };
+      return { text: text.trim() || finalAssistantText.trim() || "Done." };
     } catch (error) {
       workflow.record.status = "failed";
       workflow.record.lastError = error instanceof Error ? error.message : String(error);
@@ -219,6 +226,28 @@ async function attachmentsToNativeImages(attachments: RunnerAttachment[] | undef
     });
   }
   return images;
+}
+
+function extractAssistantText(message: unknown): string {
+  if (!isRecord(message) || message.role !== "assistant") return "";
+  return extractTextContent(message.content).trim();
+}
+
+function extractTextContent(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+
+  return content
+    .map((part) => {
+      if (!isRecord(part) || part.type !== "text") return "";
+      return typeof part.text === "string" ? part.text : "";
+    })
+    .filter(Boolean)
+    .join("\n");
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
 }
 
 type NativeImageContent = {
