@@ -1,8 +1,15 @@
+import { homedir } from "node:os";
+import { resolve } from "node:path";
 import { App, LogLevel } from "@slack/bolt";
-import type { ProjectConfig, RossbotConfig, SlackEnv, WorkflowRecord } from "./types.js";
-import { parseCommand } from "./commands.js";
+import type { ProjectConfig, RossbotConfig, RunnerAttachment, SlackEnv, WorkflowRecord } from "./types.js";
+import { normalizeSlackText, parseCommand } from "./commands.js";
 import { appendObsidianPlanLinks } from "./obsidian-links.js";
 import { enqueue, PiHostRunner } from "./pi-host-runner.js";
+import {
+  allowedAttachmentExtensionsDescription,
+  downloadSlackAttachments,
+  type SlackFileAttachment,
+} from "./slack-attachments.js";
 import { workflowKey } from "./workflow-store.js";
 
 const maxSlackMessageLength = 3900;
@@ -15,6 +22,8 @@ type SlackEvent = {
   text?: string;
   ts?: string;
   thread_ts?: string;
+  channel_type?: string;
+  files?: SlackFileAttachment[];
 };
 
 type SlackStatusReaction = "eyes" | "white_check_mark" | "x";
@@ -34,6 +43,27 @@ type SlackLogger = {
 
 const statusReactions: SlackStatusReaction[] = ["eyes", "white_check_mark", "x"];
 
+const personalAgentPrompt = `## Rossbot DM Personal Intake Agent
+
+You are Ross's private Slack DM intake agent for unscoped personal notes.
+
+Primary capability whitelist for this version:
+- Update notes inside ~/notes/my-brain only.
+- Capture, organize, summarize, and append personal notes, inbox items, ideas, and lightweight task lists as Markdown notes.
+- Ask clarifying questions when the destination note, wording, or intent is ambiguous.
+
+Current exclusions:
+- Do not create calendar events, reminders, external todo items, GitHub issues, commits, pull requests, emails, Slack messages to other people, infrastructure changes, purchases, or destructive changes.
+- If Ross asks for an excluded capability, offer to capture the request as a note in my-brain instead.
+
+Behavior policy:
+- Be optimistic for low-risk note updates: if Ross clearly asks you to capture or update a note in my-brain, do it without asking for confirmation, then briefly report the file path and what changed.
+- Ask before high-risk or ambiguous actions: deleting/replacing large content, moving/renaming files, changing project files outside my-brain, public/external actions, or anything with unclear intent.
+- Keep Slack replies concise and practical.
+- Prefer an inbox-style capture location when no better destination is obvious.
+- Preserve Ross's wording when capturing vents or raw thoughts; lightly structure only when it helps retrieval.
+`;
+
 export async function startSlackApp(input: {
   config: RossbotConfig;
   env: SlackEnv;
@@ -46,7 +76,7 @@ export async function startSlackApp(input: {
     logLevel: LogLevel.INFO,
   });
 
-  for (const slashCommand of ["/plan", "/implement", "/pr"] as const) {
+  for (const slashCommand of ["/plan", "/implement", "/pull-request"] as const) {
     app.command(slashCommand, async ({ command, ack, client, logger, respond }) => {
       await ack();
 
@@ -94,39 +124,68 @@ export async function startSlackApp(input: {
   app.message(async ({ message, client, logger }) => {
     const slackEvent = message as SlackEvent;
     if (!isAuthorized(slackEvent, input.env, logger)) return;
-    if (!slackEvent.channel || !slackEvent.text || !slackEvent.ts) return;
+    if (!slackEvent.channel || !slackEvent.ts) return;
+    if (!slackEvent.text && !slackEvent.files?.length) return;
 
     const channelId = slackEvent.channel;
     const messageTs = slackEvent.ts;
-    const project = findProject(input.config, channelId);
+    const isDm = isDirectMessage(slackEvent);
+    const project = isDm ? personalAgentProject(channelId) : findProject(input.config, channelId);
     if (!project) return;
 
     const isTopLevel = !slackEvent.thread_ts;
-    const threadTs = slackEvent.thread_ts ?? messageTs;
-    const workflow = slackEvent.thread_ts
-      ? await input.runner.getExistingWorkflow({
-          project,
-          channelId,
-          threadTs,
-        })
-      : await input.runner.getOrCreateWorkflow({ project, channelId, threadTs });
+    const replyThreadTs = isDm ? undefined : (slackEvent.thread_ts ?? messageTs);
+    const workflowThreadTs = isDm ? "dm" : (slackEvent.thread_ts ?? messageTs);
+    const workflow = isDm
+      ? await input.runner.getOrCreateWorkflow({ project, channelId, threadTs: workflowThreadTs })
+      : slackEvent.thread_ts
+        ? await input.runner.getExistingWorkflow({
+            project,
+            channelId,
+            threadTs: workflowThreadTs,
+          })
+        : await input.runner.getOrCreateWorkflow({ project, channelId, threadTs: workflowThreadTs });
 
-    if (!workflow || workflow.record.key !== workflowKey(channelId, threadTs)) return;
+    if (!workflow || workflow.record.key !== workflowKey(channelId, workflowThreadTs)) return;
     if (workflow.record.status === "closed") {
-      const command = parseCommand(slackEvent.text, input.env.botUserId);
+      const command = isDm
+        ? parsePersonalAgentCommand(slackEvent.text ?? "", input.env.botUserId)
+        : parseCommand(slackEvent.text ?? "", input.env.botUserId);
       if (command.type !== "followUp") {
         await postThreadReply(
           client,
           channelId,
-          threadTs,
+          replyThreadTs,
           "This workflow is closed. Use `/reset` to start a fresh session in this thread.",
         );
       }
       return;
     }
 
-    const command = parseCommand(slackEvent.text, input.env.botUserId);
-    if (command.type === "followUp" && command.text.trim() === "") return;
+    const command = isDm
+      ? parsePersonalAgentCommand(slackEvent.text ?? "", input.env.botUserId)
+      : parseCommand(slackEvent.text ?? "", input.env.botUserId);
+    const attachmentResult = slackEvent.files?.length
+      ? await downloadSlackAttachments({
+          botToken: input.env.botToken,
+          cwd: project.cwd,
+          channelId,
+          messageTs,
+          files: slackEvent.files,
+        })
+      : { accepted: [], ignored: [] };
+
+    if (attachmentResult.ignored.length) {
+      await postThreadReply(
+        client,
+        channelId,
+        replyThreadTs,
+        `Ignored unsupported Slack attachment(s): ${attachmentResult.ignored.join(", ")}. Allowed extensions: ${allowedAttachmentExtensionsDescription}`,
+      );
+    }
+
+    if (command.type === "followUp" && command.text.trim() === "" && attachmentResult.accepted.length === 0) return;
+    const commandWithAttachments = withAttachments(command, attachmentResult.accepted);
 
     if (isTopLevel) {
       await setStatusReaction(client, logger, { channel: channelId, timestamp: messageTs, to: "eyes" });
@@ -138,12 +197,12 @@ export async function startSlackApp(input: {
           await addReaction(client, logger, { channel: channelId, timestamp: messageTs, name: "hourglass_flowing_sand" });
         }
         await handleParsedCommand({
-          command,
+          command: commandWithAttachments,
           runner: input.runner,
           workflow,
           client,
           channelId,
-          threadTs,
+          threadTs: replyThreadTs,
         });
         if (isTopLevel) {
           await setStatusReaction(client, logger, { channel: channelId, timestamp: messageTs, to: "white_check_mark" });
@@ -153,7 +212,7 @@ export async function startSlackApp(input: {
           await setStatusReaction(client, logger, { channel: channelId, timestamp: messageTs, to: "x" });
         }
         logger.error(error);
-        await postThreadReply(client, channelId, threadTs, formatError(error));
+        await postThreadReply(client, channelId, replyThreadTs, formatError(error));
       } finally {
         if (!isTopLevel) {
           await removeReaction(client, logger, { channel: channelId, timestamp: messageTs, name: "hourglass_flowing_sand" });
@@ -247,13 +306,40 @@ function findProject(config: RossbotConfig, channelId: string): ProjectConfig | 
   return config.projects.find((project) => project.channelId === channelId);
 }
 
+function isDirectMessage(event: SlackEvent): boolean {
+  return event.channel_type === "im" || event.channel?.startsWith("D") === true;
+}
+
+function personalAgentProject(channelId: string): ProjectConfig {
+  return {
+    id: "personal-intake",
+    name: "Personal Intake",
+    cwd: resolve(homedir(), "notes", "my-brain"),
+    channelId,
+    appendSystemPrompt: personalAgentPrompt,
+  };
+}
+
+function parsePersonalAgentCommand(text: string, botUserId: string): ReturnType<typeof parseCommand> {
+  const command = parseCommand(text, botUserId);
+  if (command.type === "status" || command.type === "close" || command.type === "reset") return command;
+  return { type: "followUp", text: normalizeSlackText(text, botUserId) };
+}
+
+type ParsedCommandWithAttachments = ReturnType<typeof parseCommand> & { attachments?: RunnerAttachment[] };
+
+function withAttachments(command: ReturnType<typeof parseCommand>, attachments: RunnerAttachment[]): ParsedCommandWithAttachments {
+  if (attachments.length === 0) return command;
+  return { ...command, attachments };
+}
+
 function parseSlashCommand(command: string, text: string): Extract<ReturnType<typeof parseCommand>, { type: "plan" | "implement" | "pr" }> {
   switch (command) {
     case "/plan":
       return { type: "plan", args: text.trim() };
     case "/implement":
       return { type: "implement", args: text.trim() };
-    case "/pr":
+    case "/pull-request":
       return { type: "pr", args: text.trim() };
     default:
       throw new Error(`Unsupported slash command: ${command}`);
@@ -285,12 +371,12 @@ async function postTopLevelMessage(
 }
 
 async function handleParsedCommand(input: {
-  command: ReturnType<typeof parseCommand>;
+  command: ParsedCommandWithAttachments;
   runner: PiHostRunner;
   workflow: Awaited<ReturnType<PiHostRunner["getOrCreateWorkflow"]>>;
-  client: { chat: { postMessage(args: { channel: string; thread_ts: string; text: string }): Promise<unknown> } };
+  client: { chat: { postMessage(args: { channel: string; thread_ts?: string; text: string }): Promise<unknown> } };
   channelId: string;
-  threadTs: string;
+  threadTs?: string;
 }): Promise<void> {
   switch (input.command.type) {
     case "status":
@@ -320,15 +406,40 @@ async function handleParsedCommand(input: {
 }
 
 async function postThreadReply(
-  client: { chat: { postMessage(args: { channel: string; thread_ts: string; text: string }): Promise<unknown> } },
+  client: { chat: { postMessage(args: { channel: string; thread_ts?: string; text: string }): Promise<unknown> } },
   channelId: string,
-  threadTs: string,
+  threadTs: string | undefined,
   text: string,
 ): Promise<void> {
-  const chunks = chunkText(text || "Done.", maxSlackMessageLength);
+  const slackText = formatMarkdownForSlack(text || "Done.");
+  const chunks = chunkText(slackText, maxSlackMessageLength);
   for (const chunk of chunks) {
-    await client.chat.postMessage({ channel: channelId, thread_ts: threadTs, text: chunk });
+    await client.chat.postMessage({ channel: channelId, ...(threadTs ? { thread_ts: threadTs } : {}), text: chunk });
   }
+}
+
+function formatMarkdownForSlack(text: string): string {
+  return mapOutsideCode(text, (segment) =>
+    segment
+      // Slack mrkdwn uses single asterisks for bold; CommonMark/GitHub Markdown uses double.
+      .replace(/\*\*([^\n]+?)\*\*/g, "*$1*")
+      .replace(/__([^\n]+?)__/g, "*$1*"),
+  );
+}
+
+function mapOutsideCode(text: string, transform: (segment: string) => string): string {
+  return text
+    .split(/(```[\s\S]*?```)/g)
+    .map((fencedSegment) => {
+      if (fencedSegment.startsWith("```") && fencedSegment.endsWith("```")) return fencedSegment;
+      return fencedSegment
+        .split(/(`[^`\n]*`)/g)
+        .map((inlineSegment) =>
+          inlineSegment.startsWith("`") && inlineSegment.endsWith("`") ? inlineSegment : transform(inlineSegment),
+        )
+        .join("");
+    })
+    .join("");
 }
 
 function chunkText(text: string, maxLength: number): string[] {

@@ -46,6 +46,14 @@ export function loadSlackEnv(env = process.env): SlackEnv {
   const appToken = env.ROSSBOT_APP_TOKEN;
   const botUserId = env.ROSSBOT_USER_ID;
   const allowedUserId = env.ROSSBOT_ALLOWED_USER_ID ?? "U0ABQAC1RKJ";
+  const onboardingUserIds = parseUserIdList(
+    env.ROSSBOT_ONBOARDING_USER_IDS ??
+      env.ROSSBOT_ONBOARDING_USER_ID ??
+      env.ROSSBOT_USER_IDS ??
+      env.ROSSBOT_USERS ??
+      env.ROSSBOT_ALLOWED_USER_IDS ??
+      allowedUserId,
+  );
 
   const missing = [
     ["ROSSBOT_TOKEN", botToken],
@@ -59,7 +67,12 @@ export function loadSlackEnv(env = process.env): SlackEnv {
     throw new Error(`Missing required env vars: ${missing.join(", ")}`);
   }
 
-  return { botToken: botToken!, appToken: appToken!, botUserId: botUserId!, allowedUserId };
+  return { botToken: botToken!, appToken: appToken!, botUserId: botUserId!, allowedUserId, onboardingUserIds };
+}
+
+function parseUserIdList(value: string | undefined): string[] {
+  if (!value) return [];
+  return [...new Set(value.split(/[\s,]+/).map((item) => item.trim()).filter(Boolean))];
 }
 
 export function loadConfig(configPath: string): RossbotConfig {

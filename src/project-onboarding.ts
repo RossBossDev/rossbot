@@ -29,6 +29,8 @@ type SlackInfoResponse = {
   channel?: { id?: string; name?: string };
 };
 
+type OnboardingChannel = SlackChannelSummary & { created: boolean };
+
 export async function runProjectOnboarding(): Promise<void> {
   const repoRoot = await getCurrentGitRoot();
   const projectId = basename(repoRoot);
@@ -42,11 +44,26 @@ export async function runProjectOnboarding(): Promise<void> {
   const rl = createInterface({ input, output });
   try {
     if (existingProject) {
-      await updateExistingProject({ rl, config, project: existingProject, repoRoot, token: env.botToken });
+      await updateExistingProject({
+        rl,
+        config,
+        project: existingProject,
+        repoRoot,
+        token: env.botToken,
+        onboardingUserIds: env.onboardingUserIds,
+      });
     } else {
       const channel = await promptForChannel({ rl, token: env.botToken, defaultChannelName: projectId });
       config.projects.push({ id: projectId, name: projectName, cwd: repoRoot, channelId: channel.id });
       await saveOnboardingConfig(defaultConfigPath, config);
+      if (channel.created) {
+        await finishNewChannelSetup({
+          token: env.botToken,
+          channel,
+          projectName,
+          userIds: env.onboardingUserIds,
+        });
+      }
       console.log(`Added project "${projectName}" using #${channel.name}.`);
     }
   } finally {
@@ -60,8 +77,9 @@ async function updateExistingProject(input: {
   project: ProjectConfig;
   repoRoot: string;
   token: string;
+  onboardingUserIds: string[];
 }): Promise<void> {
-  const { rl, config, project, repoRoot, token } = input;
+  const { rl, config, project, repoRoot, token, onboardingUserIds } = input;
 
   if (resolve(project.cwd) !== repoRoot) {
     throw new Error(
@@ -85,6 +103,9 @@ async function updateExistingProject(input: {
   const channel = await promptForChannel({ rl, token, defaultChannelName: project.id });
   project.channelId = channel.id;
   await saveOnboardingConfig(defaultConfigPath, config);
+  if (channel.created) {
+    await finishNewChannelSetup({ token, channel, projectName: project.name, userIds: onboardingUserIds });
+  }
   console.log(`Updated project "${project.name}" to use #${channel.name}.`);
 }
 
@@ -92,7 +113,7 @@ async function promptForChannel(input: {
   rl: Interface;
   token: string;
   defaultChannelName: string;
-}): Promise<SlackChannelSummary> {
+}): Promise<OnboardingChannel> {
   const mode = await promptChoice(input.rl, "Use an existing public Slack channel or create a new one?", [
     { key: "1", label: "Use existing channel", value: "existing" },
     { key: "2", label: "Create new public channel", value: "create" },
@@ -105,7 +126,7 @@ async function promptForChannel(input: {
   return promptForNewChannel(input.rl, input.token, input.defaultChannelName);
 }
 
-async function promptForExistingChannel(rl: Interface, token: string): Promise<SlackChannelSummary> {
+async function promptForExistingChannel(rl: Interface, token: string): Promise<OnboardingChannel> {
   const channels = await listPublicChannels(token);
   if (channels.length === 0) {
     throw new Error("No public Slack channels were returned by conversations.list.");
@@ -120,7 +141,7 @@ async function promptForExistingChannel(rl: Interface, token: string): Promise<S
     const answer = (await rl.question("Choose a channel number: ")).trim();
     const selectedIndex = Number.parseInt(answer, 10) - 1;
     if (Number.isInteger(selectedIndex) && channels[selectedIndex]) {
-      return channels[selectedIndex];
+      return { ...channels[selectedIndex], created: false };
     }
     console.log(`Enter a number from 1 to ${channels.length}.`);
   }
@@ -130,7 +151,7 @@ async function promptForNewChannel(
   rl: Interface,
   token: string,
   defaultChannelName: string,
-): Promise<SlackChannelSummary> {
+): Promise<OnboardingChannel> {
   const normalizedDefault = normalizeSlackChannelName(defaultChannelName);
   while (true) {
     const answer = (await rl.question(`New public channel name (${normalizedDefault}): `)).trim();
@@ -139,7 +160,8 @@ async function promptForNewChannel(
       console.log("Enter a channel name containing at least one letter or number.");
       continue;
     }
-    return createPublicChannel(token, name);
+    const channel = await createPublicChannel(token, name);
+    return { ...channel, created: true };
   }
 }
 
@@ -172,6 +194,21 @@ async function saveOnboardingConfig(configPath: string, config: RossbotConfig): 
   await writeFile(configPath, `${JSON.stringify(config, null, 2)}\n`, "utf8");
 }
 
+async function finishNewChannelSetup(input: {
+  token: string;
+  channel: SlackChannelSummary;
+  projectName: string;
+  userIds: string[];
+}): Promise<void> {
+  if (input.userIds.length > 0) {
+    await inviteUsersToChannel(input.token, input.channel.id, input.userIds);
+    console.log(`Invited ${input.userIds.length} user(s) to #${input.channel.name}.`);
+  }
+
+  await postWelcomeMessage(input.token, input.channel.id, input.projectName);
+  console.log(`Posted a welcome message to #${input.channel.name}.`);
+}
+
 async function listPublicChannels(token: string): Promise<SlackChannelSummary[]> {
   const channels: SlackChannelSummary[] = [];
   let cursor: string | undefined;
@@ -198,6 +235,17 @@ async function createPublicChannel(token: string, name: string): Promise<SlackCh
     throw new Error("Slack conversations.create did not return a channel id and name.");
   }
   return { id: response.channel.id, name: response.channel.name };
+}
+
+async function inviteUsersToChannel(token: string, channelId: string, userIds: string[]): Promise<void> {
+  await callSlackApi(token, "conversations.invite", new URLSearchParams({ channel: channelId, users: userIds.join(",") }));
+}
+
+async function postWelcomeMessage(token: string, channelId: string, projectName: string): Promise<void> {
+  const text =
+    `:wave: Welcome! Rossbot is now connected to the \`${projectName}\` project.\n\n` +
+    "Top-level messages in this channel start a pi workflow thread. Try `plan ...`, `implement ...`, or `pr ...`.";
+  await callSlackApi(token, "chat.postMessage", new URLSearchParams({ channel: channelId, text }));
 }
 
 async function resolveChannelName(token: string, channelId: string): Promise<string | undefined> {

@@ -15,15 +15,17 @@ export function normalizeSlackText(text: string, botUserId: string): string {
 
 export function parseCommand(text: string, botUserId: string): ParsedCommand {
   const normalized = normalizeSlackText(text, botUserId);
-  const match = normalized.match(/^\/?(plan|implement|pr|status|close|reset)(?:\s+([\s\S]*))?$/);
+  const match = normalized.match(/^\/?(plan|implement|pr|pull-request|status|close|reset)(?:\s+([\s\S]*))?$/);
   if (!match) return { type: "followUp", text: normalized };
 
   const [, command, args = ""] = match;
   switch (command) {
     case "plan":
     case "implement":
-    case "pr":
       return { type: command, args: args.trim() };
+    case "pr":
+    case "pull-request":
+      return { type: "pr", args: args.trim() };
     case "status":
     case "close":
     case "reset":

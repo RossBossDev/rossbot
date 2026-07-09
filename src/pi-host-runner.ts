@@ -1,8 +1,10 @@
-import { createAgentSession, SessionManager } from "@earendil-works/pi-coding-agent";
+import { readFile } from "node:fs/promises";
+import { createAgentSession, DefaultResourceLoader, getAgentDir, SessionManager } from "@earendil-works/pi-coding-agent";
 import type {
   AgentRunner,
   AgentSession,
   ProjectConfig,
+  RunnerAttachment,
   RunnerCommand,
   RunnerResponse,
   WorkflowRecord,
@@ -47,7 +49,7 @@ export class PiHostRunner implements AgentRunner {
     const cached = this.workflows.get(key);
     if (cached) return cached;
 
-    const session = await this.openSession(project.cwd, existing?.sessionFile);
+    const session = await this.openSession(project, existing?.sessionFile);
     const now = new Date().toISOString();
     const record: WorkflowRecord = existing ?? {
       key,
@@ -68,7 +70,7 @@ export class PiHostRunner implements AgentRunner {
     record.updatedAt = now;
     await this.store.upsert(record);
 
-    const runtime: WorkflowRuntime = { record, session, queue: Promise.resolve() };
+    const runtime: WorkflowRuntime = { project, record, session, queue: Promise.resolve() };
     this.workflows.set(key, runtime);
     return runtime;
   }
@@ -76,6 +78,7 @@ export class PiHostRunner implements AgentRunner {
   async send(input: { workflow: WorkflowRuntime; command: RunnerCommand }): Promise<RunnerResponse> {
     const workflow = input.workflow;
     const prompt = commandToPrompt(input.command);
+    const images = await attachmentsToNativeImages(input.command.attachments);
 
     workflow.record.status = "running";
     workflow.record.lastError = undefined;
@@ -90,7 +93,7 @@ export class PiHostRunner implements AgentRunner {
     });
 
     try {
-      await workflow.session.prompt(prompt);
+      await workflow.session.prompt(prompt, images.length ? { images } : undefined);
       workflow.record.status = "idle";
       workflow.record.sessionId = workflow.session.sessionId;
       workflow.record.sessionFile = workflow.session.sessionFile;
@@ -110,7 +113,7 @@ export class PiHostRunner implements AgentRunner {
 
   async reset(input: { workflow: WorkflowRuntime }): Promise<WorkflowRuntime> {
     input.workflow.session.dispose();
-    const session = await this.openSession(input.workflow.record.cwd);
+    const session = await this.openSession(input.workflow.project);
     const now = new Date().toISOString();
     input.workflow.record.sessionId = session.sessionId;
     input.workflow.record.sessionFile = session.sessionFile;
@@ -131,9 +134,24 @@ export class PiHostRunner implements AgentRunner {
     this.workflows.delete(input.workflow.record.key);
   }
 
-  private async openSession(cwd: string, sessionFile?: string): Promise<AgentSession> {
-    const sessionManager = sessionFile ? SessionManager.open(sessionFile, undefined, cwd) : SessionManager.create(cwd);
-    const { session } = await createAgentSession({ cwd, sessionManager });
+  private async openSession(project: ProjectConfig, sessionFile?: string): Promise<AgentSession> {
+    const sessionManager = sessionFile
+      ? SessionManager.open(sessionFile, undefined, project.cwd)
+      : SessionManager.create(project.cwd);
+
+    if (!project.appendSystemPrompt) {
+      const { session } = await createAgentSession({ cwd: project.cwd, sessionManager });
+      return session;
+    }
+
+    const resourceLoader = new DefaultResourceLoader({
+      cwd: project.cwd,
+      agentDir: getAgentDir(),
+      appendSystemPromptOverride: (base) => [...base, project.appendSystemPrompt!],
+    });
+    await resourceLoader.reload();
+
+    const { session } = await createAgentSession({ cwd: project.cwd, sessionManager, resourceLoader });
     return session;
   }
 }
@@ -144,25 +162,67 @@ export function enqueue(workflow: WorkflowRuntime, task: () => Promise<void>): P
 }
 
 function commandToPrompt(command: RunnerCommand): string {
+  const attachmentSection = formatAttachmentPromptSection(command.attachments);
+
   switch (command.type) {
     case "plan":
       return `Load and follow \`~/.pi/agent/skills/ross-plan/SKILL.md\`.
 
 Plan topic/request from this Slack thread:
-${command.args}`;
+${command.args}${attachmentSection}`;
     case "implement":
       return `Load and follow \`~/.pi/agent/skills/implement/SKILL.md\`.
 
 Use the plan/context already discussed in this Slack thread unless I specify otherwise.
 Additional request:
-${command.args}`;
+${command.args}${attachmentSection}`;
     case "pr":
       return `Load and follow \`~/.pi/agent/skills/commit-pr/SKILL.md\`.
 
 Use the current repo state and the context already discussed in this Slack thread.
 Additional request:
-${command.args}`;
+${command.args}${attachmentSection}`;
     case "followUp":
-      return command.text;
+      return `${command.text}${attachmentSection}`;
   }
 }
+
+function formatAttachmentPromptSection(attachments: RunnerAttachment[] | undefined): string {
+  if (!attachments?.length) return "";
+
+  const files = attachments
+    .map((attachment) => {
+      const nativeNote = attachment.nativeImage ? " (also provided as native image input)" : "";
+      return `- ${attachment.filename}: ${attachment.path}${nativeNote}`;
+    })
+    .join("\n");
+
+  return `
+
+Attachments saved from Slack:
+${files}
+
+Use the read tool to inspect relevant attachment files before acting. Images marked as native image input are also available directly in this prompt.`;
+}
+
+async function attachmentsToNativeImages(attachments: RunnerAttachment[] | undefined): Promise<NativeImageContent[]> {
+  if (!attachments?.length) return [];
+
+  const images: NativeImageContent[] = [];
+  for (const attachment of attachments) {
+    if (!attachment.nativeImage || !attachment.mediaType?.startsWith("image/")) continue;
+    const data = await readFile(attachment.path, "base64");
+    images.push({
+      type: "image",
+      data,
+      mimeType: attachment.mediaType,
+    });
+  }
+  return images;
+}
+
+type NativeImageContent = {
+  type: "image";
+  data: string;
+  mimeType: string;
+};

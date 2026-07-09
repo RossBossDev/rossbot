@@ -7,6 +7,7 @@ export type ProjectConfig = {
   name: string;
   cwd: string;
   channelId: string;
+  appendSystemPrompt?: string;
 };
 
 export type RossbotConfig = {
@@ -18,6 +19,7 @@ export type SlackEnv = {
   appToken: string;
   botUserId: string;
   allowedUserId: string;
+  onboardingUserIds: string[];
 };
 
 export type CliCommand = { command: "start"; configPath: string } | { command: "projectAdd" };
@@ -44,16 +46,25 @@ export type WorkflowRecord = {
 };
 
 export type WorkflowRuntime = {
+  project: ProjectConfig;
   record: WorkflowRecord;
   session: AgentSession;
   queue: Promise<void>;
 };
 
+export type RunnerAttachment = {
+  filename: string;
+  path: string;
+  mediaType?: string;
+  size: number;
+  nativeImage?: boolean;
+};
+
 export type RunnerCommand =
-  | { type: "plan"; args: string }
-  | { type: "implement"; args: string }
-  | { type: "pr"; args: string }
-  | { type: "followUp"; text: string };
+  | { type: "plan"; args: string; attachments?: RunnerAttachment[] }
+  | { type: "implement"; args: string; attachments?: RunnerAttachment[] }
+  | { type: "pr"; args: string; attachments?: RunnerAttachment[] }
+  | { type: "followUp"; text: string; attachments?: RunnerAttachment[] };
 
 export type RunnerResponse = {
   text: string;
