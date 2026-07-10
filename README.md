@@ -124,7 +124,7 @@ Direct messages to Rossbot from the allowed Slack user are handled as a separate
 
 The DM agent's current capability whitelist is intentionally narrow: optimistic low-risk updates to notes in `~/notes/my-brain`, with clarification required for ambiguous or higher-risk actions. Calendar events, reminders, external todo items, GitHub issues, commits/PRs, emails, public Slack messages, infrastructure changes, purchases, and destructive edits are out of scope for now; the agent should offer to capture those requests as notes instead.
 
-Slack must deliver IM events to the app, e.g. subscribe to `message.im` and grant the corresponding bot token scope such as `im:history` plus `chat:write`.
+Slack should deliver IM events to the app, e.g. subscribe to `message.im` and grant bot token scopes such as `im:history`, `im:write`, `chat:write`, and `reactions:write`. Rossbot also starts a best-effort DM polling fallback so personal intake can still work when Socket Mode IM event delivery is missing or delayed.
 
 ## Validation
 

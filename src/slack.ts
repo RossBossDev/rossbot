@@ -27,6 +27,17 @@ type SlackEvent = {
   files?: SlackFileAttachment[];
 };
 
+type SlackMessageClient = SlackStatusClient & {
+  chat: { postMessage(args: { channel: string; thread_ts?: string; text: string }): Promise<unknown> };
+};
+
+type SlackDmPollingClient = SlackMessageClient & {
+  conversations: {
+    open(args: { users: string }): Promise<{ channel?: { id?: string } }>;
+    history(args: { channel: string; oldest?: string; inclusive?: boolean; limit?: number }): Promise<{ messages?: SlackEvent[] }>;
+  };
+};
+
 type SlackStatusReaction = "eyes" | "white_check_mark" | "x";
 type SlackReaction = SlackStatusReaction | "hourglass_flowing_sand";
 
@@ -138,153 +149,249 @@ export async function startSlackApp(input: {
     });
   }
 
+  const handledMessageKeys = new Set<string>();
+
   app.message(async ({ message, client, logger }) => {
-    const slackEvent = message as SlackEvent;
-    logDebug("Received Slack message event", {
-      channelId: slackEvent.channel,
-      userId: slackEvent.user,
-      ts: slackEvent.ts,
-      threadTs: slackEvent.thread_ts,
-      channelType: slackEvent.channel_type,
-      hasText: Boolean(slackEvent.text),
-      fileCount: slackEvent.files?.length ?? 0,
-      hasBotId: Boolean(slackEvent.bot_id),
-    });
-    if (!isAuthorized(slackEvent, input.env, logger)) return;
-    if (!slackEvent.channel || !slackEvent.ts) {
-      logDebug("Ignoring Slack message missing channel or timestamp");
-      return;
-    }
-    if (!slackEvent.text && !slackEvent.files?.length) {
-      logDebug("Ignoring Slack message with no text or files", { channelId: slackEvent.channel, ts: slackEvent.ts });
-      return;
-    }
-
-    const channelId = slackEvent.channel;
-    const messageTs = slackEvent.ts;
-    const isDm = isDirectMessage(slackEvent);
-    const project = isDm ? personalAgentProject(channelId) : findProject(input.config, channelId);
-    if (!project) {
-      logDebug("Ignoring Slack message for unregistered channel", { channelId });
-      return;
-    }
-
-    const isTopLevel = !slackEvent.thread_ts;
-    const replyThreadTs = isDm ? undefined : (slackEvent.thread_ts ?? messageTs);
-    const workflowThreadTs = isDm ? "dm" : (slackEvent.thread_ts ?? messageTs);
-    const workflow = isDm
-      ? await input.runner.getOrCreateWorkflow({ project, channelId, threadTs: workflowThreadTs })
-      : slackEvent.thread_ts
-        ? await input.runner.getExistingWorkflow({
-            project,
-            channelId,
-            threadTs: workflowThreadTs,
-          })
-        : await input.runner.getOrCreateWorkflow({ project, channelId, threadTs: workflowThreadTs });
-
-    if (!workflow || workflow.record.key !== workflowKey(channelId, workflowThreadTs)) {
-      logDebug("Ignoring Slack reply without existing workflow", { channelId, threadTs: workflowThreadTs, projectId: project.id });
-      return;
-    }
-    if (workflow.record.status === "closed") {
-      const command = isDm
-        ? parsePersonalAgentCommand(slackEvent.text ?? "", input.env.botUserId)
-        : parseCommand(slackEvent.text ?? "", input.env.botUserId);
-      if (command.type !== "followUp") {
-        await postThreadReply(
-          client,
-          channelId,
-          replyThreadTs,
-          "This workflow is closed. Use `/reset` to start a fresh session in this thread.",
-        );
-      }
-      return;
-    }
-
-    const command = isDm
-      ? parsePersonalAgentCommand(slackEvent.text ?? "", input.env.botUserId)
-      : parseCommand(slackEvent.text ?? "", input.env.botUserId);
-    logInfo("Routing Slack message to workflow", {
-      channelId,
-      messageTs,
-      workflowThreadTs,
-      projectId: project.id,
-      isDm,
-      isTopLevel,
-      commandType: command.type,
-      workflowStatus: workflow.record.status,
-      fileCount: slackEvent.files?.length ?? 0,
-    });
-    const attachmentResult = slackEvent.files?.length
-      ? await downloadSlackAttachments({
-          botToken: input.env.botToken,
-          cwd: project.cwd,
-          channelId,
-          messageTs,
-          files: slackEvent.files,
-        })
-      : { accepted: [], ignored: [] };
-
-    if (attachmentResult.accepted.length || attachmentResult.ignored.length) {
-      logInfo("Slack attachments processed", {
-        channelId,
-        messageTs,
-        projectId: project.id,
-        acceptedCount: attachmentResult.accepted.length,
-        ignoredCount: attachmentResult.ignored.length,
-        ignored: attachmentResult.ignored,
-      });
-    }
-
-    if (attachmentResult.ignored.length) {
-      await postThreadReply(
-        client,
-        channelId,
-        replyThreadTs,
-        `Ignored unsupported Slack attachment(s): ${attachmentResult.ignored.join(", ")}. Allowed extensions: ${allowedAttachmentExtensionsDescription}`,
-      );
-    }
-
-    if (command.type === "followUp" && command.text.trim() === "" && attachmentResult.accepted.length === 0) return;
-    const commandWithAttachments = withAttachments(command, attachmentResult.accepted);
-
-    if (isTopLevel) {
-      await setStatusReaction(client, logger, { channel: channelId, timestamp: messageTs, to: "eyes" });
-    }
-
-    await enqueue(workflow, async () => {
-      try {
-        if (!isTopLevel) {
-          await addReaction(client, logger, { channel: channelId, timestamp: messageTs, name: "hourglass_flowing_sand" });
-        }
-        await handleParsedCommand({
-          command: commandWithAttachments,
-          runner: input.runner,
-          workflow,
-          client,
-          channelId,
-          threadTs: replyThreadTs,
-        });
-        if (isTopLevel) {
-          await setStatusReaction(client, logger, { channel: channelId, timestamp: messageTs, to: "white_check_mark" });
-        }
-      } catch (error) {
-        if (isTopLevel) {
-          await setStatusReaction(client, logger, { channel: channelId, timestamp: messageTs, to: "x" });
-        }
-        logger.error(error);
-        logError("Slack message workflow failed", { channelId, threadTs: replyThreadTs, projectId: project.id, ...errorContext(error) });
-        await postThreadReply(client, channelId, replyThreadTs, formatError(error));
-      } finally {
-        if (!isTopLevel) {
-          await removeReaction(client, logger, { channel: channelId, timestamp: messageTs, name: "hourglass_flowing_sand" });
-        }
-      }
+    await routeSlackMessage({
+      slackEvent: message as SlackEvent,
+      client,
+      logger,
+      input,
+      handledMessageKeys,
+      source: "socket-mode",
     });
   });
 
   await app.start();
   logInfo("Rossbot Slack Socket Mode app started");
+  void startDmPollingFallback({ client: app.client as SlackDmPollingClient, logger: consoleSlackLogger, input, handledMessageKeys });
+}
+
+async function routeSlackMessage(input: {
+  slackEvent: SlackEvent;
+  client: SlackMessageClient;
+  logger: SlackLogger & { error?(error: unknown): void };
+  input: { config: RossbotConfig; env: SlackEnv; runner: PiHostRunner };
+  handledMessageKeys: Set<string>;
+  source: "socket-mode" | "dm-polling";
+}): Promise<void> {
+  const { slackEvent, client, logger } = input;
+  logDebug("Received Slack message event", {
+    source: input.source,
+    channelId: slackEvent.channel,
+    userId: slackEvent.user,
+    ts: slackEvent.ts,
+    threadTs: slackEvent.thread_ts,
+    channelType: slackEvent.channel_type,
+    hasText: Boolean(slackEvent.text),
+    fileCount: slackEvent.files?.length ?? 0,
+    hasBotId: Boolean(slackEvent.bot_id),
+  });
+  if (!isAuthorized(slackEvent, input.input.env, logger)) return;
+  if (!slackEvent.channel || !slackEvent.ts) {
+    logDebug("Ignoring Slack message missing channel or timestamp", { source: input.source });
+    return;
+  }
+
+  const messageKey = `${slackEvent.channel}:${slackEvent.ts}`;
+  if (input.handledMessageKeys.has(messageKey)) {
+    logDebug("Ignoring already handled Slack message", { source: input.source, messageKey });
+    return;
+  }
+  input.handledMessageKeys.add(messageKey);
+
+  if (!slackEvent.text && !slackEvent.files?.length) {
+    logDebug("Ignoring Slack message with no text or files", { channelId: slackEvent.channel, ts: slackEvent.ts });
+    return;
+  }
+
+  const channelId = slackEvent.channel;
+  const messageTs = slackEvent.ts;
+  const isDm = isDirectMessage(slackEvent);
+  const project = isDm ? personalAgentProject(channelId) : findProject(input.input.config, channelId);
+  if (!project) {
+    logDebug("Ignoring Slack message for unregistered channel", { channelId });
+    return;
+  }
+
+  const isTopLevel = !slackEvent.thread_ts;
+  const replyThreadTs = isDm ? undefined : (slackEvent.thread_ts ?? messageTs);
+  const workflowThreadTs = isDm ? "dm" : (slackEvent.thread_ts ?? messageTs);
+  const workflow = isDm
+    ? await input.input.runner.getOrCreateWorkflow({ project, channelId, threadTs: workflowThreadTs })
+    : slackEvent.thread_ts
+      ? await input.input.runner.getExistingWorkflow({
+          project,
+          channelId,
+          threadTs: workflowThreadTs,
+        })
+      : await input.input.runner.getOrCreateWorkflow({ project, channelId, threadTs: workflowThreadTs });
+
+  if (!workflow || workflow.record.key !== workflowKey(channelId, workflowThreadTs)) {
+    logDebug("Ignoring Slack reply without existing workflow", { channelId, threadTs: workflowThreadTs, projectId: project.id });
+    return;
+  }
+  if (workflow.record.status === "closed") {
+    const command = isDm
+      ? parsePersonalAgentCommand(slackEvent.text ?? "", input.input.env.botUserId)
+      : parseCommand(slackEvent.text ?? "", input.input.env.botUserId);
+    if (command.type !== "followUp") {
+      await postThreadReply(
+        client,
+        channelId,
+        replyThreadTs,
+        "This workflow is closed. Use `/reset` to start a fresh session in this thread.",
+      );
+    }
+    return;
+  }
+
+  const command = isDm
+    ? parsePersonalAgentCommand(slackEvent.text ?? "", input.input.env.botUserId)
+    : parseCommand(slackEvent.text ?? "", input.input.env.botUserId);
+  logInfo("Routing Slack message to workflow", {
+    source: input.source,
+    channelId,
+    messageTs,
+    workflowThreadTs,
+    projectId: project.id,
+    isDm,
+    isTopLevel,
+    commandType: command.type,
+    workflowStatus: workflow.record.status,
+    fileCount: slackEvent.files?.length ?? 0,
+  });
+  const attachmentResult = slackEvent.files?.length
+    ? await downloadSlackAttachments({
+        botToken: input.input.env.botToken,
+        cwd: project.cwd,
+        channelId,
+        messageTs,
+        files: slackEvent.files,
+      })
+    : { accepted: [], ignored: [] };
+
+  if (attachmentResult.accepted.length || attachmentResult.ignored.length) {
+    logInfo("Slack attachments processed", {
+      channelId,
+      messageTs,
+      projectId: project.id,
+      acceptedCount: attachmentResult.accepted.length,
+      ignoredCount: attachmentResult.ignored.length,
+      ignored: attachmentResult.ignored,
+    });
+  }
+
+  if (attachmentResult.ignored.length) {
+    await postThreadReply(
+      client,
+      channelId,
+      replyThreadTs,
+      `Ignored unsupported Slack attachment(s): ${attachmentResult.ignored.join(", ")}. Allowed extensions: ${allowedAttachmentExtensionsDescription}`,
+    );
+  }
+
+  if (command.type === "followUp" && command.text.trim() === "" && attachmentResult.accepted.length === 0) return;
+  const commandWithAttachments = withAttachments(command, attachmentResult.accepted);
+
+  if (isTopLevel) {
+    await setStatusReaction(client, logger, { channel: channelId, timestamp: messageTs, to: "eyes" });
+  }
+
+  await enqueue(workflow, async () => {
+    try {
+      if (!isTopLevel) {
+        await addReaction(client, logger, { channel: channelId, timestamp: messageTs, name: "hourglass_flowing_sand" });
+      }
+      await handleParsedCommand({
+        command: commandWithAttachments,
+        runner: input.input.runner,
+        workflow,
+        client,
+        channelId,
+        threadTs: replyThreadTs,
+      });
+      if (isTopLevel) {
+        await setStatusReaction(client, logger, { channel: channelId, timestamp: messageTs, to: "white_check_mark" });
+      }
+    } catch (error) {
+      if (isTopLevel) {
+        await setStatusReaction(client, logger, { channel: channelId, timestamp: messageTs, to: "x" });
+      }
+      logger.error?.(error);
+      logError("Slack message workflow failed", { channelId, threadTs: replyThreadTs, projectId: project.id, ...errorContext(error) });
+      await postThreadReply(client, channelId, replyThreadTs, formatError(error));
+    } finally {
+      if (!isTopLevel) {
+        await removeReaction(client, logger, { channel: channelId, timestamp: messageTs, name: "hourglass_flowing_sand" });
+      }
+    }
+  });
+}
+
+const consoleSlackLogger: SlackLogger & { error(error: unknown): void } = {
+  debug: (message) => logDebug(message),
+  warn: (message) => logWarn(message),
+  error: (error) => logError("Slack DM polling handler error", errorContext(error)),
+};
+
+async function startDmPollingFallback(input: {
+  client: SlackDmPollingClient;
+  logger: SlackLogger & { error(error: unknown): void };
+  input: { config: RossbotConfig; env: SlackEnv; runner: PiHostRunner };
+  handledMessageKeys: Set<string>;
+}): Promise<void> {
+  try {
+    const opened = await input.client.conversations.open({ users: input.input.env.allowedUserId });
+    const channelId = opened.channel?.id;
+    if (!channelId) throw new Error("Slack conversations.open did not return a DM channel id.");
+
+    const initial = await input.client.conversations.history({ channel: channelId, limit: 1 });
+    let lastSeenTs = maxSlackTs(initial.messages?.map((message) => message.ts).filter(isString) ?? []) ?? "0";
+    logInfo("Slack DM polling fallback started", { channelId, lastSeenTs });
+
+    for (;;) {
+      await sleep(5000);
+      try {
+        const history = await input.client.conversations.history({ channel: channelId, oldest: lastSeenTs, inclusive: false, limit: 25 });
+        const messages = (history.messages ?? [])
+          .filter((message) => message.ts && compareSlackTs(message.ts, lastSeenTs) > 0)
+          .sort((a, b) => compareSlackTs(a.ts!, b.ts!));
+
+        for (const message of messages) {
+          await routeSlackMessage({
+            slackEvent: { ...message, channel: channelId, channel_type: "im" },
+            client: input.client,
+            logger: input.logger,
+            input: input.input,
+            handledMessageKeys: input.handledMessageKeys,
+            source: "dm-polling",
+          });
+          if (message.ts && compareSlackTs(message.ts, lastSeenTs) > 0) lastSeenTs = message.ts;
+        }
+      } catch (error) {
+        logWarn("Slack DM polling fallback failed", errorContext(error));
+      }
+    }
+  } catch (error) {
+    logWarn("Slack DM polling fallback disabled", errorContext(error));
+  }
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function maxSlackTs(values: string[]): string | undefined {
+  return values.reduce<string | undefined>((max, value) => (max === undefined || compareSlackTs(value, max) > 0 ? value : max), undefined);
+}
+
+function compareSlackTs(a: string, b: string): number {
+  return Number(a) - Number(b);
+}
+
+function isString(value: unknown): value is string {
+  return typeof value === "string";
 }
 
 async function setStatusReaction(
